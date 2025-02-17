@@ -1,2 +1,6 @@
 .env
 lib/
+scripts/
+share/
+.venv/
+.pytest_cache/
