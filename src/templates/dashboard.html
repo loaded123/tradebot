@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+<h1>Trading Bot Dashboard</h1>
+
+<div id="performance">
+    <p>Profit/Loss: {{ performance.pnl }} USD</p>
+    <p>Number of Trades: {{ performance.num_trades }}</p>
+    <p>Win Rate: {{ (performance.win_rate * 100)|round }}%</p>
+    <p>Last Update: {{ performance.last_update }}</p>
+</div>
+
+<canvas id="pnlChart"></canvas>
+
+<h2>Recent Logs</h2>
+<pre id="logDisplay">
+{% for line in logs %}
+{{ line }}
+{% endfor %}
+</pre>
+
+<script>
+    // Chart.js for a simple PnL chart
+    var ctx = document.getElementById('pnlChart').getContext('2d');
+    var myChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: ['Day 1', 'Day 2', 'Day 3', 'Day 4', 'Day 5'],
+            datasets: [{
+                label: 'PnL',
+                data: [0, 100, 200, 300, 400], // Mock PnL data. Fetch this from your API in real scenario.
+                backgroundColor: 'rgba(0, 119, 204, 0.3)',
+                borderColor: 'rgba(0, 119, 204, 1)',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            scales: {
+                y: {
+                    beginAtZero: true
+                }
+            }
+        }
+    });
+
+    // Real-time updates for logs
+    setInterval(function() {
+        fetch('/api/logs')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('logDisplay').innerHTML = data.logs.join('\n');
+            });
+    }, 5000);  // Update every 5 seconds
+
+    // Real-time updates for performance metrics (you can expand this to update the chart as well)
+    setInterval(function() {
+        fetch('/api/performance')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('performance').innerHTML = 
+                    `<p>Profit/Loss: ${data.pnl} USD</p>
+                     <p>Number of Trades: ${data.num_trades}</p>
+                     <p>Win Rate: ${(data.win_rate * 100).toFixed(2)}%</p>
+                     <p>Last Update: ${data.last_update}</p>`;
+            });
+    }, 10000);  // Update every 10 seconds
+</script>
+
+</body>
+</html>

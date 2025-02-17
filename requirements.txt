@@ -1,0 +1,11 @@
+coinbase
+pandas
+numpy
+torch
+scikit-learn
+ta
+flask
+schedule
+asyncio
+websockets
+ccxt
