@@ -5,6 +5,9 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
 from src.constants import FEATURE_COLUMNS
 import joblib
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 def select_features(df, target_col, n_features=10):
     """
@@ -39,43 +42,32 @@ def preprocess_data(df, feature_scaler=None, target_scaler=None):
     if target_scaler is None:
         target_scaler = MinMaxScaler()
 
-    # Calculate returns and other features
-    df['returns'] = df['close'].pct_change().fillna(0)
-    df['log_returns'] = np.log1p(df['returns']).fillna(0)
-    df['price_volatility'] = df['returns'].rolling(10).std().fillna(0)
-
-    from ta.volatility import AverageTrueRange
-    atr_indicator = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14, fillna=True)
-    df['atr'] = atr_indicator.average_true_range()
-
-    from ta.momentum import RSIIndicator
-    from ta.trend import MACD
-    df['momentum_rsi'] = RSIIndicator(close=df['close']).rsi().fillna(0)
-    macd = MACD(close=df['close'])
-    df['trend_macd'] = macd.macd().fillna(0)
-
-    df['sma_20'] = df['close'].rolling(window=20).mean().fillna(df['close'])  # Replace NaNs with close price
-
-    df['volume'] = np.log1p(df['volume'])
-
-    df['target'] = df['close'].shift(-1)
-    df.dropna(inplace=True)
-
-    # Debugging: Ensure no NaNs
-    print("Final DataFrame NaN check:\n", df.isnull().sum())
+    logging.info("After calculating returns:\n%s", df['returns'].head())
+    logging.info("After calculating ATR:\n%s", df['atr'].head())
+    logging.info("After calculating RSI:\n%s", df['momentum_rsi'].head())
+    logging.info("After calculating MACD:\n%s", df['trend_macd'].head())
+    
+    # Check for all zero features
+    for feature in ['momentum_rsi', 'trend_macd', 'atr', 'price_volatility']:
+        if df[feature].abs().sum() == 0:
+            logging.warning(f"{feature} is all zeros; check data or calculation.")
 
     # Select only the features listed in FEATURE_COLUMNS
     df = df[FEATURE_COLUMNS + ['target']]
 
     # Apply feature scaling 
     df[FEATURE_COLUMNS] = feature_scaler.fit_transform(df[FEATURE_COLUMNS])
+    logging.info("After feature scaling:\n%s", df[FEATURE_COLUMNS].head())
 
     # Apply target scaling
     df['target'] = target_scaler.fit_transform(df[['target']])
+    logging.info("After target scaling:\n%s", df['target'].head())
 
     # Save scalers
     joblib.dump(feature_scaler, 'feature_scaler.pkl')
     joblib.dump(target_scaler, 'target_scaler.pkl')
+
+    logging.info("Final DataFrame NaN check:\n%s", df.isnull().sum())
 
     return df
 

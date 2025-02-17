@@ -1,11 +1,14 @@
 import asyncio
 import ccxt.async_support as ccxt  # Async version of CCXT
 import pandas as pd
-import numpy as np  # Add numpy import
-import talib  # Add TA-Lib import for technical indicators
+import numpy as np
+import talib
 from datetime import datetime
+import logging
 
-async def fetch_historical_data(symbol, timeframe='1h', limit=1000):
+logging.basicConfig(level=logging.INFO)
+
+async def fetch_historical_data(symbol, timeframe='1h', limit=3000):
     """
     Fetch historical OHLCV data from Gemini asynchronously.
     
@@ -25,21 +28,23 @@ async def fetch_historical_data(symbol, timeframe='1h', limit=1000):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         
-        # Debug: Print fetched data columns
-        print("Fetched data columns:", df.columns)
+        logging.info("Fetched data columns: %s", df.columns)
         
         # Check if there are enough rows for ATR calculation (at least 14)
         if len(df) < 14:
             raise ValueError("DataFrame must contain at least 14 rows to calculate ATR.")
         
         # Feature Engineering: Adding technical indicators
-        df['returns'] = df['close'].pct_change()
-        df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
-        df['price_volatility'] = df['close'].rolling(window=14).std()
-        df['atr'] = df['high'].subtract(df['low']).rolling(window=14).mean()  # ATR for volatility
-        df['momentum_rsi'] = talib.RSI(df['close'], timeperiod=14)
+        df['returns'] = df['close'].pct_change().fillna(0)
+        df['log_returns'] = np.log1p(df['returns']).fillna(0)  # Use log1p for numerical stability
+        df['price_volatility'] = df['returns'].rolling(window=14).std().fillna(0)
+        
+        # Implement a more robust ATR calculation
+        df['atr'] = df['high'].subtract(df['low']).rolling(window=14).mean().bfill()
+        df['momentum_rsi'] = talib.RSI(df['close'], timeperiod=14).bfill()
         df['trend_macd'], _, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-        df['sma_20'] = df['close'].rolling(window=20).mean()
+        df['trend_macd'] = df['trend_macd'].bfill()  # Fill NaN with backward fill
+        df['sma_20'] = df['close'].rolling(window=20).mean().fillna(df['close'])  # Fill NaN with close price
         
         # Target variable for supervised learning
         df['target'] = df['close'].shift(-1)
@@ -47,13 +52,13 @@ async def fetch_historical_data(symbol, timeframe='1h', limit=1000):
         # Drop rows with NaN values (e.g., due to shifting or rolling calculations)
         df.dropna(inplace=True)
 
-        # Debug: Print columns before scaling
-        print("Columns before scaling:", df.columns)
+        logging.info("Columns before scaling: %s", df.columns)
+        logging.info("Sample of data:\n%s", df.head())
 
         return df
 
     except Exception as e:
-        print(f"Error fetching data from Gemini: {e}")
+        logging.error(f"Error fetching data from Gemini: {e}")
         return pd.DataFrame()  # Return empty DataFrame on error
 
     finally:
@@ -79,7 +84,7 @@ async def fetch_real_time_data(symbol):
                 'volume': ticker['baseVolume']
             }
         except Exception as e:
-            print(f"Error fetching real-time data: {e}")
+            logging.error(f"Error fetching real-time data: {e}")
         
         await asyncio.sleep(1)  # Poll every second
 
@@ -87,11 +92,11 @@ if __name__ == "__main__":
     async def main():
         # Fetch historical data example
         df = await fetch_historical_data('BTC/USD')
-        print(df.head())
+        logging.info(df.head())
 
         # Example usage for real-time data
         async for data in fetch_real_time_data('BTC/USD'):
-            print(data)
+            logging.info(data)
             # Implement your processing logic here
             await asyncio.sleep(1)  # Adjust the sleep time as needed
 
