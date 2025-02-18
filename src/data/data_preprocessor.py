@@ -1,3 +1,5 @@
+# File: src/data/data_preprocessor.py
+
 import numpy as np
 import pandas as pd
 from sklearn.feature_selection import SelectFromModel
@@ -8,6 +10,24 @@ import joblib
 import logging
 
 logging.basicConfig(level=logging.INFO)
+
+def remove_outliers(df, columns):
+    """
+    Remove outliers from the DataFrame using the Interquartile Range (IQR) method.
+
+    :param df: DataFrame containing the data
+    :param columns: List of column names to check for outliers
+    :return: DataFrame with outliers removed
+    """
+    df_cleaned = df.copy()
+    for column in columns:
+        Q1 = df[column].quantile(0.25)
+        Q3 = df[column].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        df_cleaned = df_cleaned[(df_cleaned[column] >= lower_bound) & (df_cleaned[column] <= upper_bound)]
+    return df_cleaned
 
 def select_features(df, target_col, n_features=10):
     """
@@ -33,15 +53,21 @@ def select_features(df, target_col, n_features=10):
     return df[selected_features + [target_col]]
 
 def preprocess_data(df, feature_scaler=None, target_scaler=None):
+    """
+    Preprocess the data by removing outliers, scaling features, and checking for zero features.
+
+    :param df: Raw DataFrame with OHLCV data
+    :param feature_scaler: Scaler for feature normalization (e.g., MinMaxScaler)
+    :param target_scaler: Scaler for target normalization (e.g., MinMaxScaler)
+    :return: Preprocessed DataFrame
+    """
     if len(df) < 14:
         raise ValueError("DataFrame must contain at least 14 rows to calculate ATR.")
     
-    # Initialize scalers if not provided
-    if feature_scaler is None:
-        feature_scaler = MinMaxScaler()
-    if target_scaler is None:
-        target_scaler = MinMaxScaler()
-
+    # Remove outliers
+    columns_to_check = FEATURE_COLUMNS + ['target']
+    df = remove_outliers(df, columns_to_check)
+    
     logging.info("After calculating returns:\n%s", df['returns'].head())
     logging.info("After calculating ATR:\n%s", df['atr'].head())
     logging.info("After calculating RSI:\n%s", df['momentum_rsi'].head())
@@ -58,6 +84,12 @@ def preprocess_data(df, feature_scaler=None, target_scaler=None):
     # Convert DataFrame to numpy array for fitting
     df_features = df[FEATURE_COLUMNS].values
     df_target = df[['target']].values
+
+    # Initialize scalers if not provided
+    if feature_scaler is None:
+        feature_scaler = MinMaxScaler()
+    if target_scaler is None:
+        target_scaler = MinMaxScaler()
 
     # Fit scalers with numpy arrays
     feature_scaler.fit(df_features)

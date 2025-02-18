@@ -19,25 +19,11 @@ import sklearn
 import numpy
 import pandas
 import torch
+from src.models.lstm_model import LSTMModel  # Import LSTMModel from the new file
 
 logging.basicConfig(level=logging.INFO)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64, layer_dim=2, output_dim=1, dropout=0.2):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True, dropout=dropout)
-        self.layer_norm = nn.LayerNorm(hidden_dim)  # Layer Norm for stabilization
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        h0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size, device=x.device)
-        c0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size, device=x.device)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.layer_norm(out[:, -1, :])  # Apply layer norm on the last output
-        return self.fc(out)
-
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=100):
     best_val_loss = float('inf')
@@ -210,38 +196,7 @@ if __name__ == "__main__":
             # Train the model
             model = train_model(model, train_loader, val_loader, criterion, optimizer)
 
-            logging.info("Training completed. Saving model...")
-            model_save_path = os.path.join(os.getcwd(), "best_model.pth")
-            logging.info(f"Model save path: {model_save_path}")
-            torch.save(model.state_dict(), model_save_path)
-
-            # Evaluate the model
-            feature_scaler = joblib.load('feature_scaler.pkl')
-            target_scaler = joblib.load('target_scaler.pkl')
-            
-            logging.info(f"Feature scaler n_features_in_: {feature_scaler.n_features_in_}")
-            logging.info(f"Feature scaler feature_names_in_: {feature_scaler.feature_names_in_ if hasattr(feature_scaler, 'feature_names_in_') else 'None'}")
-            logging.info(f"Target scaler n_features_in_: {target_scaler.n_features_in_}")
-            logging.info(f"Target scaler feature_names_in_: {target_scaler.feature_names_in_ if hasattr(target_scaler, 'feature_names_in_') else 'None'}")
-
-            logging.info(f"Shape of X_test before evaluation: {X_test.shape}")
-            logging.info(f"Shape of y_test before evaluation: {y_test.shape}")
-            mse, mae, errors = evaluate_model(model, X_test, y_test, feature_scaler, target_scaler)
-            logging.info(f"Final Model MSE: {mse:.6f}, MAE: {mae:.6f}")
-
-            # Library version check
-            logging.info(f"Sklearn version: {sklearn.__version__}")
-            logging.info(f"Numpy version: {numpy.__version__}")
-            logging.info(f"Pandas version: {pandas.__version__}")
-            logging.info(f"Torch version: {torch.__version__}")
-
-            # Additional analysis could be added here, like plotting predictions vs actual or examining feature importance
-
-        except FileNotFoundError as fnf:
-            logging.error(f"File not found error: {fnf}")
-        except PermissionError as pe:
-            logging.error(f"Permission error: {pe}")
         except Exception as e:
-            logging.error(f"Unexpected error during training or saving: {e}")
+            logging.error(f"Unexpected error: {e}")
 
     asyncio.run(main())
