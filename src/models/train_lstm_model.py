@@ -15,6 +15,10 @@ import logging
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 import seaborn as sns
+import sklearn
+import numpy
+import pandas
+import torch
 
 logging.basicConfig(level=logging.INFO)
 
@@ -85,28 +89,26 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 def evaluate_model(model, X_test, y_test, feature_scaler, target_scaler):
     model.eval()
     with torch.no_grad():
-        # Ensure X_test is 3D [samples, sequence_length, features]
         assert len(X_test.shape) == 3, f"X_test should be 3D, got shape {X_test.shape}"
         n_samples, seq_length, n_features = X_test.shape
         X_test_2d = X_test.reshape(-1, n_features)  # Flatten to 2D
         logging.info(f"Shape of X_test_2d before scaling: {X_test_2d.shape}")
         try:
             X_test_scaled_2d = feature_scaler.transform(X_test_2d)
+            logging.info(f"Shape of X_test_scaled_2d after scaling: {X_test_scaled_2d.shape}")
         except Exception as e:
             logging.error(f"Error scaling features: {e}. Shape of X_test_2d: {X_test_2d.shape}")
             raise
         X_test_scaled = X_test_scaled_2d.reshape(n_samples, seq_length, n_features)
-        logging.info(f"Shape of X_test_scaled after scaling: {X_test_scaled.shape}")
+        logging.info(f"Shape of X_test_scaled after reshaping: {X_test_scaled.shape}")
 
-        # y_test should be 1D
         assert y_test.ndim == 1, f"y_test should be 1D, got shape {y_test.shape}"
         try:
             y_test_scaled = target_scaler.transform(y_test.reshape(-1, 1))
+            logging.info(f"Shape of y_test_scaled after scaling: {y_test_scaled.shape}")
         except Exception as e:
             logging.error(f"Error scaling target: {e}. Shape of y_test: {y_test.shape}")
             raise
-
-        logging.info(f"Shape of y_test_scaled: {y_test_scaled.shape}")
 
         # Convert to tensors and move to device
         X_test_tensor = torch.FloatTensor(X_test_scaled).to(device)
@@ -114,19 +116,27 @@ def evaluate_model(model, X_test, y_test, feature_scaler, target_scaler):
 
         # Get predictions
         y_pred = model(X_test_tensor)
+        logging.info(f"Shape of y_pred before inverse transform: {y_pred.shape}")
 
         # Inverse transform predictions and targets
         y_pred_unscaled = target_scaler.inverse_transform(y_pred.cpu().numpy())
         y_test_unscaled = target_scaler.inverse_transform(y_test_scaled)
+        
+        logging.info(f"Shape of y_pred_unscaled after inverse transform: {y_pred_unscaled.shape}")
+        logging.info(f"Shape of y_test_unscaled after inverse transform: {y_test_unscaled.shape}")
 
-        # Calculate MSE and MAE
-        mse = nn.MSELoss()(torch.FloatTensor(y_pred_unscaled), torch.FloatTensor(y_test_unscaled)).item()
-        mae = nn.L1Loss()(torch.FloatTensor(y_pred_unscaled), torch.FloatTensor(y_test_unscaled)).item()
+        # Flatten the arrays to 1D for metric calculation
+        y_pred_unscaled = y_pred_unscaled.flatten()
+        y_test_unscaled = y_test_unscaled.flatten()
+
+        # Calculate MSE and MAE using sklearn for simplicity
+        mse = mean_squared_error(y_test_unscaled, y_pred_unscaled)
+        mae = mean_absolute_error(y_test_unscaled, y_pred_unscaled)
 
         # Error analysis
-        errors = np.abs(y_pred_unscaled - y_test_unscaled.flatten())
+        errors = np.abs(y_pred_unscaled - y_test_unscaled)
         plt.figure(figsize=(10, 6))
-        sns.scatterplot(x=y_test_unscaled.flatten(), y=errors)
+        sns.scatterplot(x=y_test_unscaled, y=errors)
         plt.xlabel('Actual Values')
         plt.ylabel('Absolute Error')
         plt.title('Error Analysis')
@@ -208,10 +218,22 @@ if __name__ == "__main__":
             # Evaluate the model
             feature_scaler = joblib.load('feature_scaler.pkl')
             target_scaler = joblib.load('target_scaler.pkl')
+            
+            logging.info(f"Feature scaler n_features_in_: {feature_scaler.n_features_in_}")
+            logging.info(f"Feature scaler feature_names_in_: {feature_scaler.feature_names_in_ if hasattr(feature_scaler, 'feature_names_in_') else 'None'}")
+            logging.info(f"Target scaler n_features_in_: {target_scaler.n_features_in_}")
+            logging.info(f"Target scaler feature_names_in_: {target_scaler.feature_names_in_ if hasattr(target_scaler, 'feature_names_in_') else 'None'}")
+
             logging.info(f"Shape of X_test before evaluation: {X_test.shape}")
             logging.info(f"Shape of y_test before evaluation: {y_test.shape}")
             mse, mae, errors = evaluate_model(model, X_test, y_test, feature_scaler, target_scaler)
             logging.info(f"Final Model MSE: {mse:.6f}, MAE: {mae:.6f}")
+
+            # Library version check
+            logging.info(f"Sklearn version: {sklearn.__version__}")
+            logging.info(f"Numpy version: {numpy.__version__}")
+            logging.info(f"Pandas version: {pandas.__version__}")
+            logging.info(f"Torch version: {torch.__version__}")
 
             # Additional analysis could be added here, like plotting predictions vs actual or examining feature importance
 

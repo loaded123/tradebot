@@ -55,12 +55,19 @@ def preprocess_data(df, feature_scaler=None, target_scaler=None):
     # Select only the features listed in FEATURE_COLUMNS
     df = df[FEATURE_COLUMNS + ['target']]
 
-    # Apply feature scaling 
-    df[FEATURE_COLUMNS] = feature_scaler.fit_transform(df[FEATURE_COLUMNS])
-    logging.info("After feature scaling:\n%s", df[FEATURE_COLUMNS].head())
+    # Convert DataFrame to numpy array for fitting
+    df_features = df[FEATURE_COLUMNS].values
+    df_target = df[['target']].values
 
-    # Apply target scaling
-    df['target'] = target_scaler.fit_transform(df[['target']])
+    # Fit scalers with numpy arrays
+    feature_scaler.fit(df_features)
+    target_scaler.fit(df_target)
+
+    # Apply scaling 
+    df[FEATURE_COLUMNS] = feature_scaler.transform(df_features)
+    df['target'] = target_scaler.transform(df_target).flatten()  # Ensure target is 1D after scaling
+
+    logging.info("After feature scaling:\n%s", df[FEATURE_COLUMNS].head())
     logging.info("After target scaling:\n%s", df['target'].head())
 
     # Save scalers
