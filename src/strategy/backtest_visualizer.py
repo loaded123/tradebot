@@ -1,29 +1,28 @@
 import asyncio
 import sys
 import os
+import logging
 
-# Ensure the correct event loop policy on Windows
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
-import asyncio
-import winloop
-from src.models.train_lstm_model import LSTMModel
 import joblib
+
+from src.models.lstm_model import LSTMModel
 from src.strategy.backtester import backtest_strategy
 from src.data.data_fetcher import fetch_historical_data
-from src.data.data_preprocessor import preprocess_data, FEATURE_COLUMNS
+from src.data.data_preprocessor import preprocess_data
 from src.constants import FEATURE_COLUMNS
 from src.strategy.strategy_generator import generate_signals
 from src.strategy.market_regime import detect_market_regime
 from src.strategy.position_sizer import calculate_position_size
 from src.strategy.risk_manager import manage_risk
-from src.strategy.strategy_adapter import adapt_strategy_parameters
 
-# Assuming device is defined in train_lstm_model.py or here
+logging.basicConfig(level=logging.INFO)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def plot_backtest_results(results):
@@ -71,16 +70,28 @@ def plot_backtest_results(results):
     plt.tight_layout()
     plt.show()
 
-def load_model(model_class, model_path="best_model.pth", input_dim=12, hidden_dim=32, layer_dim=1, output_dim=1):
-    # Check if the model file exists
+def load_model(model_class):
+    model_path = "best_model.pth"
+    input_dim = len(FEATURE_COLUMNS)
+    hidden_dim = 256  # Or your hidden dimension
+    layer_dim = 2     # Or your number of layers
+
     if os.path.exists(model_path):
-        print(f"Loading model from {model_path}...")
-        model = model_class(input_dim, hidden_dim, layer_dim, output_dim).to(device)  # Send model to device
-        model.load_state_dict(torch.load(model_path, map_location=device))  # Ensure it loads to the correct device
-        model.eval()
+        try:
+            dummy_model = model_class(input_dim=input_dim, hidden_dim=hidden_dim, layer_dim=layer_dim).to(device)
+            dummy_model.load_state_dict(torch.load(model_path, map_location=device))
+            logging.info(f"Loaded model from {model_path}")
+            model = dummy_model
+        except RuntimeError as e:
+            logging.warning(f"Architecture mismatch, consider retraining: {e}")
+            return None
+        except Exception as e:
+            logging.warning(f"Error loading model: {e}")
+            return None
     else:
-        print(f"Model file {model_path} not found, training a new model...")
-        model = None
+        logging.warning(f"Model file not found: {model_path}")
+        return None
+
     return model
 
 
@@ -114,58 +125,50 @@ async def main():
     historical_data = await fetch_historical_data(symbol)
 
     preprocessed_data = preprocess_data(historical_data)
-    
-    # Debug: Print columns to ensure 'sma_20' is included before scaling
-    print("Columns before scaling:", preprocessed_data.columns)
-    
-    # Load your model with original parameters
-    model = load_model(LSTMModel)  # Pass the class name here
 
+    model = load_model(LSTMModel)
     if model is None:
-        print("Model could not be loaded. Exiting.")
+        logging.error("Model loading failed. Exiting.")
         return
 
-    # Load the scalers
     feature_scaler = joblib.load('feature_scaler.pkl')
     target_scaler = joblib.load('target_scaler.pkl')
 
-    # Ensure the feature columns match what the scaler was fitted with
-    feature_columns = FEATURE_COLUMNS
+    scaled_data = preprocessed_data[FEATURE_COLUMNS]
+    scaled_data = feature_scaler.transform(scaled_data)
+    scaled_df = pd.DataFrame(scaled_data, columns=FEATURE_COLUMNS, index=preprocessed_data.index)
 
-    # Scale the data with the correct feature names
-    data_to_scale = preprocessed_data[feature_columns]
-    scaled_data = feature_scaler.transform(data_to_scale)
-
-    # Explicitly set feature names after scaling
-    scaled_df = pd.DataFrame(scaled_data, columns=feature_columns, index=preprocessed_data.index)
-
-    # Detect market regime
     regime = detect_market_regime(preprocessed_data)
-    
-    # Adapt strategy parameters based on market regime
-    if regime == 'Bullish Low Volatility':
-        adapted_params = {'rsi_threshold': 60, 'macd_fast': 10, 'macd_slow': 20, 'atr_multiplier': 1.5, 'max_risk_pct': 0.02}
-    elif regime == 'Bullish High Volatility':
-        adapted_params = {'rsi_threshold': 70, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2.5, 'max_risk_pct': 0.01}
-    elif regime == 'Bearish Low Volatility':
-        adapted_params = {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2, 'max_risk_pct': 0.02}
-    else:  # Bearish High Volatility
-        adapted_params = {'rsi_threshold': 40, 'macd_fast': 15, 'macd_slow': 30, 'atr_multiplier': 3, 'max_risk_pct': 0.01}
-    
-    # Generate signals with adapted parameters
-    signal_data = generate_signals(scaled_df, model, feature_columns, feature_scaler, target_scaler, **adapted_params)
-    
-    # Manage risk
-    current_balance = 10000  # Example initial balance
+
+    regime_params = {
+        'Bullish Low Volatility': {'rsi_threshold': 60, 'macd_fast': 10, 'macd_slow': 20, 'atr_multiplier': 1.5,
+                                  'max_risk_pct': 0.02},
+        'Bullish High Volatility': {'rsi_threshold': 70, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2.5,
+                                   'max_risk_pct': 0.01},
+        'Bearish Low Volatility': {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2,
+                                  'max_risk_pct': 0.02},
+        'Bearish High Volatility': {'rsi_threshold': 40, 'macd_fast': 15, 'macd_slow': 30, 'atr_multiplier': 3,
+                                    'max_risk_pct': 0.01},
+    }
+
+    adapted_params = regime_params.get(regime)
+
+    if adapted_params is None:
+        logging.warning(f"Unknown market regime: {regime}. Using default parameters.")
+        adapted_params = {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2,
+                         'max_risk_pct': 0.02}
+
+    signal_data = generate_signals(scaled_df, model, FEATURE_COLUMNS, feature_scaler, target_scaler, **adapted_params)
+
+    current_balance = 10000
     signal_data = manage_risk(signal_data, current_balance)
-    
-    # Filter signals to reduce frequency
+
     signal_data = filter_signals(signal_data)
 
-    # Backtest the strategy
     results = backtest_strategy(signal_data)
 
-    # Plot the backtest results
     plot_backtest_results(results)
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64, layer_dim=2, output_dim=1, dropout=0.2):
+    def __init__(self, input_dim, hidden_dim=256, layer_dim=2, output_dim=1, dropout=0.2):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True, dropout=dropout)
         self.layer_norm = nn.LayerNorm(hidden_dim)  # Layer Norm for stabilization

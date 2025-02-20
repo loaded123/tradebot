@@ -8,17 +8,12 @@ from sklearn.preprocessing import MinMaxScaler
 from src.constants import FEATURE_COLUMNS
 import joblib
 import logging
+from src.strategy.indicators import compute_vwap, compute_adx  # Import indicators functions
 
 logging.basicConfig(level=logging.INFO)
 
 def remove_outliers(df, columns):
-    """
-    Remove outliers from the DataFrame using the Interquartile Range (IQR) method.
-
-    :param df: DataFrame containing the data
-    :param columns: List of column names to check for outliers
-    :return: DataFrame with outliers removed
-    """
+    """Remove outliers from the DataFrame using the Interquartile Range (IQR) method."""
     df_cleaned = df.copy()
     for column in columns:
         Q1 = df[column].quantile(0.25)
@@ -30,57 +25,53 @@ def remove_outliers(df, columns):
     return df_cleaned
 
 def select_features(df, target_col, n_features=10):
-    """
-    Select top n features based on Random Forest Importance.
-
-    :param df: DataFrame containing features
-    :param target_col: Column name for the target variable
-    :param n_features: Number of top features to select
-    :return: DataFrame with selected features
-    """
+    """Select top n features based on Random Forest Importance."""
     X = df.drop(target_col, axis=1)
     y = df[target_col].values
-    
-    # Initialize Random Forest
+
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
     rf.fit(X, y)
-    
-    # Use SelectFromModel to select features
+
     selector = SelectFromModel(rf, prefit=True, max_features=n_features)
     selected_features = list(X.columns[selector.get_support()])
-    
-    # Return DataFrame with only selected features and target
+
     return df[selected_features + [target_col]]
 
 def preprocess_data(df, feature_scaler=None, target_scaler=None):
-    """
-    Preprocess the data by removing outliers, scaling features, and checking for zero features.
+    """Preprocesses the data."""
 
-    :param df: Raw DataFrame with OHLCV data
-    :param feature_scaler: Scaler for feature normalization (e.g., MinMaxScaler)
-    :param target_scaler: Scaler for target normalization (e.g., MinMaxScaler)
-    :return: Preprocessed DataFrame
-    """
     if len(df) < 14:
         raise ValueError("DataFrame must contain at least 14 rows to calculate ATR.")
-    
-    # Remove outliers
-    columns_to_check = FEATURE_COLUMNS + ['target']
+
+    # Calculate indicators *before* outlier removal and feature selection
+    df['returns'] = df['close'].pct_change()
+    df['log_returns'] = np.log1p(df['returns'])
+    df['price_volatility'] = df['log_returns'].rolling(window=14).std() * (252**0.5)  # Annualized Volatility
+    df['sma_20'] = df['close'].rolling(window=20).mean()
+    df['atr'] = df['high'].rolling(window=14).apply(lambda x: max(abs(x[1:] - x[:-1])), raw=True)
+    df['vwap'] = compute_vwap(df)
+    df['adx'] = compute_adx(df, period=20)  # ADX period can be adjusted here
+    df['target'] = df['close'].shift(-1)  # Next period's closing price
+    df.fillna(0, inplace=True) # Fill NaN values
+
+    # Remove outliers (now includes the calculated indicators)
+    columns_to_check = FEATURE_COLUMNS + ['target', 'vwap', 'adx', 'atr']  # Include new columns
     df = remove_outliers(df, columns_to_check)
-    
+
     logging.info("After calculating returns:\n%s", df['returns'].head())
     logging.info("After calculating ATR:\n%s", df['atr'].head())
-    logging.info("After calculating RSI:\n%s", df['momentum_rsi'].head())
-    logging.info("After calculating MACD:\n%s", df['trend_macd'].head())
-    
-    # Check for all zero features
-    for feature in ['momentum_rsi', 'trend_macd', 'atr', 'price_volatility']:
+    logging.info("After calculating VWAP:\n%s", df['vwap'].head())
+    logging.info("After calculating ADX:\n%s", df['adx'].head())
+
+    # Check for all zero features (after outlier removal)
+    for feature in ['momentum_rsi', 'trend_macd', 'atr', 'price_volatility', 'vwap', 'adx']:
         if df[feature].abs().sum() == 0:
             logging.warning(f"{feature} is all zeros; check data or calculation.")
 
-    # Select only the features listed in FEATURE_COLUMNS
-    df = df[FEATURE_COLUMNS + ['target']]
+    # Select features (after indicator calculation and outlier removal)
+    df = df[FEATURE_COLUMNS + ['target']]  # Keep only the selected features
 
+    # ... (rest of the scaling and saving logic remains the same)
     # Convert DataFrame to numpy array for fitting
     df_features = df[FEATURE_COLUMNS].values
     df_target = df[['target']].values
