@@ -1,41 +1,53 @@
-# Add to src/strategy/market_regime.py
+# src/strategy/market_regime.py
+
+import pandas as pd
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 
 def detect_market_regime(df, window=60):
     """
-    Detect market regime based on price movement characteristics.
+    Detect market regime based on price movement and volatility.
 
-    :param df: DataFrame with price data
-    :param window: Window for calculating regime metrics
-    :return: String indicating the current market regime
+    Args:
+        df (pd.DataFrame): DataFrame with 'returns', 'price_volatility' columns
+        window (int): Lookback period for metrics
+    
+    Returns:
+        str: Market regime
     """
-    returns = df['returns'].rolling(window).mean().iloc[-1]
-    volatility = df['price_volatility'].rolling(window).mean().iloc[-1]
-    
-    if returns > 0 and volatility < df['price_volatility'].mean():
-        return 'Bullish Low Volatility'
-    elif returns > 0 and volatility > df['price_volatility'].mean():
-        return 'Bullish High Volatility'
-    elif returns < 0 and volatility < df['price_volatility'].mean():
-        return 'Bearish Low Volatility'
-    else:
-        return 'Bearish High Volatility'
-
-# Usage in backtest_visualizer.py
-async def main():
+    try:
+        if 'returns' not in df.columns or 'price_volatility' not in df.columns:
+            raise ValueError("DataFrame missing 'returns' or 'price_volatility' columns")
         
-    # Before generating signals
-    regime = detect_market_regime(preprocessed_data)
-    if regime == 'Bullish Low Volatility':
-        # Adjust strategy for a trending market with less risk
-        adapted_params = {'rsi_threshold': 60, 'macd_fast': 10, 'macd_slow': 20, 'atr_multiplier': 1.5}
-    elif regime == 'Bullish High Volatility':
-        # Strategy for a volatile bull market
-        adapted_params = {'rsi_threshold': 70, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2.5}
-    elif regime == 'Bearish Low Volatility':
-        # Strategy for a bear market with low volatility
-        adapted_params = {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2}
-    else:
-        # Strategy for a volatile bear market
-        adapted_params = {'rsi_threshold': 40, 'macd_fast': 15, 'macd_slow': 30, 'atr_multiplier': 3}
+        returns = df['returns'].rolling(window).mean().iloc[-1]
+        volatility = df['price_volatility'].rolling(window).mean().iloc[-1]
+        vol_mean = df['price_volatility'].mean()
+        
+        logging.debug(f"Returns: {returns}, Volatility: {volatility}, Vol Mean: {vol_mean}")
+        
+        if pd.isna(returns) or pd.isna(volatility):
+            logging.warning("NaN detected in regime calculation, returning default regime")
+            return 'Neutral'
+        
+        if returns > 0 and volatility < vol_mean:
+            return 'Bullish Low Volatility'
+        elif returns > 0 and volatility >= vol_mean:
+            return 'Bullish High Volatility'
+        elif returns < 0 and volatility < vol_mean:
+            return 'Bearish Low Volatility'
+        else:
+            return 'Bearish High Volatility'
     
-    signal_data = generate_signals(scaled_df, model, feature_columns, feature_scaler, target_scaler, **adapted_params)
+    except Exception as e:
+        logging.error(f"Error detecting market regime: {e}")
+        return 'Neutral'
+
+if __name__ == "__main__":
+    # Dummy test
+    dummy_df = pd.DataFrame({
+        'returns': [0.01] * 30 + [-0.01] * 30,
+        'price_volatility': [0.02] * 30 + [0.05] * 30
+    }, index=pd.date_range("2024-01-01", periods=60, freq="H"))
+    regime = detect_market_regime(dummy_df)
+    print(f"Detected regime: {regime}")

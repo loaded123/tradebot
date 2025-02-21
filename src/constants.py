@@ -2,5 +2,6 @@
 
 FEATURE_COLUMNS = [
     'open', 'high', 'low', 'close', 'volume', 'momentum_rsi', 'trend_macd',
-    'atr', 'returns', 'log_returns', 'price_volatility', 'sma_20', 'vwap', 'adx'
+    'atr', 'returns', 'log_returns', 'price_volatility', 'sma_20', 'vwap', 'adx',
+    'ema_50', 'bollinger_upper', 'bollinger_lower'
 ]

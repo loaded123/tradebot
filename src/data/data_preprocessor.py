@@ -1,19 +1,17 @@
-# File: src/data/data_preprocessor.py
+# src/data/data_preprocessor.py
 
 import numpy as np
 import pandas as pd
-from sklearn.feature_selection import SelectFromModel
-from sklearn.ensemble import RandomForestRegressor
+import pandas_ta as ta
 from sklearn.preprocessing import MinMaxScaler
 from src.constants import FEATURE_COLUMNS
 import joblib
 import logging
-from src.strategy.indicators import compute_vwap, compute_adx  # Import indicators functions
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 
 def remove_outliers(df, columns):
-    """Remove outliers from the DataFrame using the Interquartile Range (IQR) method."""
+    """Remove outliers using IQR method."""
     df_cleaned = df.copy()
     for column in columns:
         Q1 = df[column].quantile(0.25)
@@ -24,107 +22,88 @@ def remove_outliers(df, columns):
         df_cleaned = df_cleaned[(df_cleaned[column] >= lower_bound) & (df_cleaned[column] <= upper_bound)]
     return df_cleaned
 
-def select_features(df, target_col, n_features=10):
-    """Select top n features based on Random Forest Importance."""
-    X = df.drop(target_col, axis=1)
-    y = df[target_col].values
-
-    rf = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf.fit(X, y)
-
-    selector = SelectFromModel(rf, prefit=True, max_features=n_features)
-    selected_features = list(X.columns[selector.get_support()])
-
-    return df[selected_features + [target_col]]
-
 def preprocess_data(df, feature_scaler=None, target_scaler=None):
-    """Preprocesses the data."""
+    """Preprocess OHLCV data for training."""
+    if len(df) < 20:  # Increased minimum rows for SMA_20 and ADX
+        raise ValueError("DataFrame must contain at least 20 rows for indicator calculations.")
 
-    if len(df) < 14:
-        raise ValueError("DataFrame must contain at least 14 rows to calculate ATR.")
+    df_processed = df.copy()
 
-    # Calculate indicators *before* outlier removal and feature selection
-    df['returns'] = df['close'].pct_change()
-    df['log_returns'] = np.log1p(df['returns'])
-    df['price_volatility'] = df['log_returns'].rolling(window=14).std() * (252**0.5)  # Annualized Volatility
-    df['sma_20'] = df['close'].rolling(window=20).mean()
-    df['atr'] = df['high'].rolling(window=14).apply(lambda x: max(abs(x[1:] - x[:-1])), raw=True)
-    df['vwap'] = compute_vwap(df)
-    df['adx'] = compute_adx(df, period=20)  # ADX period can be adjusted here
-    df['target'] = df['close'].shift(-1)  # Next period's closing price
-    df.fillna(0, inplace=True) # Fill NaN values
+    # Calculate technical indicators
+    df_processed['returns'] = df_processed['close'].pct_change()
+    df_processed['log_returns'] = np.log1p(df_processed['returns'])
+    df_processed['price_volatility'] = df_processed['log_returns'].rolling(window=14).std() * (252 ** 0.5)
+    df_processed['sma_20'] = df_processed['close'].rolling(window=20).mean()
+    df_processed['atr'] = ta.atr(df_processed['high'], df_processed['low'], df_processed['close'], length=14)
+    df_processed['vwap'] = ta.vwap(df_processed['high'], df_processed['low'], df_processed['close'], df_processed['volume'])
+    df_processed['adx'] = ta.adx(df_processed['high'], df_processed['low'], df_processed['close'], length=20)['ADX_20']
+    df_processed['momentum_rsi'] = ta.rsi(df_processed['close'], length=14)
+    df_processed['trend_macd'] = ta.macd(df_processed['close'], fast=12, slow=26, signal=9)['MACD_12_26_9']
+    df_processed['ema_50'] = df_processed['close'].ewm(span=50).mean()
+    
+    # Calculate Bollinger Bands and dynamically assign columns
+    bbands = ta.bbands(df_processed['close'], length=20, std=2)
+    logging.info(f"Bollinger Bands columns: {bbands.columns.tolist()}")  # Debug column names
+    if 'BBU_20_2.0' in bbands.columns:
+        df_processed['bollinger_upper'] = bbands['BBU_20_2.0']
+    elif 'BBU_20_2' in bbands.columns:
+        df_processed['bollinger_upper'] = bbands['BBU_20_2']
+    else:
+        raise KeyError(f"Unexpected Bollinger Bands upper band column. Found: {bbands.columns.tolist()}")
+    
+    if 'BBL_20_2.0' in bbands.columns:
+        df_processed['bollinger_lower'] = bbands['BBL_20_2.0']
+    elif 'BBL_20_2' in bbands.columns:
+        df_processed['bollinger_lower'] = bbands['BBL_20_2']
+    else:
+        raise KeyError(f"Unexpected Bollinger Bands lower band column. Found: {bbands.columns.tolist()}")
 
-    # Remove outliers (now includes the calculated indicators)
-    columns_to_check = FEATURE_COLUMNS + ['target', 'vwap', 'adx', 'atr']  # Include new columns
-    df = remove_outliers(df, columns_to_check)
+    df_processed['target'] = df_processed['close'].shift(-1)
 
-    logging.info("After calculating returns:\n%s", df['returns'].head())
-    logging.info("After calculating ATR:\n%s", df['atr'].head())
-    logging.info("After calculating VWAP:\n%s", df['vwap'].head())
-    logging.info("After calculating ADX:\n%s", df['adx'].head())
+    # Drop NaNs from rolling calculations
+    df_processed.dropna(inplace=True)
 
-    # Check for all zero features (after outlier removal)
-    for feature in ['momentum_rsi', 'trend_macd', 'atr', 'price_volatility', 'vwap', 'adx']:
-        if df[feature].abs().sum() == 0:
+    # Remove outliers
+    columns_to_check = FEATURE_COLUMNS + ['target']
+    df_processed = remove_outliers(df_processed, columns_to_check)
+
+    # Ensure no all-zero features
+    for feature in FEATURE_COLUMNS:
+        if df_processed[feature].abs().sum() == 0:
             logging.warning(f"{feature} is all zeros; check data or calculation.")
 
-    # Select features (after indicator calculation and outlier removal)
-    df = df[FEATURE_COLUMNS + ['target']]  # Keep only the selected features
+    # Subset to required columns
+    df_processed = df_processed[FEATURE_COLUMNS + ['target']]
 
-    # ... (rest of the scaling and saving logic remains the same)
-    # Convert DataFrame to numpy array for fitting
-    df_features = df[FEATURE_COLUMNS].values
-    df_target = df[['target']].values
-
-    # Initialize scalers if not provided
+    # Scaling with 17 features
     if feature_scaler is None:
         feature_scaler = MinMaxScaler()
     if target_scaler is None:
         target_scaler = MinMaxScaler()
 
-    # Fit scalers with numpy arrays
+    df_features = df_processed[FEATURE_COLUMNS].values  # 17 features
+    df_target = df_processed[['target']].values
+
     feature_scaler.fit(df_features)
     target_scaler.fit(df_target)
 
-    # Apply scaling 
-    df[FEATURE_COLUMNS] = feature_scaler.transform(df_features)
-    df['target'] = target_scaler.transform(df_target).flatten()  # Ensure target is 1D after scaling
-
-    logging.info("After feature scaling:\n%s", df[FEATURE_COLUMNS].head())
-    logging.info("After target scaling:\n%s", df['target'].head())
+    df_processed[FEATURE_COLUMNS] = feature_scaler.transform(df_features)
+    df_processed['target'] = target_scaler.transform(df_target).flatten()
 
     # Save scalers
     joblib.dump(feature_scaler, 'feature_scaler.pkl')
     joblib.dump(target_scaler, 'target_scaler.pkl')
 
-    logging.info("Final DataFrame NaN check:\n%s", df.isnull().sum())
+    logging.info(f"Final DataFrame shape: {df_processed.shape}")
+    logging.info(f"NaN check:\n{df_processed.isnull().sum()}")
 
-    return df
+    return df_processed
 
 def split_data(df, train_ratio=0.8):
-    """
-    Split the data into training and testing sets.
-
-    :param df: Preprocessed DataFrame
-    :param train_ratio: Ratio of data to use for training
-    :return: Tuple of X_train, X_test, y_train, y_test
-    """
+    """Split data into train and test sets."""
     X = df.drop(columns=['target'])
     y = df['target']
     train_size = int(len(X) * train_ratio)
     X_train, X_test = X[:train_size], X[train_size:]
     y_train, y_test = y[:train_size], y[train_size:]
     return X_train, X_test, y_train, y_test
-
-def prepare_data_for_training(df, train_ratio=0.8, feature_scaler=None, target_scaler=None):
-    """
-    Prepare the data for training by preprocessing, feature selection, and splitting.
-
-    :param df: Raw DataFrame with OHLCV data
-    :param train_ratio: Ratio of data to use for training
-    :param feature_scaler: Scaler for feature normalization (e.g., MinMaxScaler)
-    :param target_scaler: Scaler for target normalization (e.g., MinMaxScaler)
-    :return: Tuple of X_train, X_test, y_train, y_test
-    """
-    preprocessed_df = preprocess_data(df, feature_scaler, target_scaler)
-    return split_data(preprocessed_df, train_ratio)
