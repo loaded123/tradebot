@@ -1,23 +1,24 @@
-# src/backtest_visualizer.py
-
 import asyncio
 import sys
 import os
 import logging
 import matplotlib.pyplot as plt
 import pandas as pd
-import numpy as np
 import torch
 import joblib
-from src.models.lstm_model import LSTMModel
+from src.models.transformer_model import TransformerPredictor
 from src.data.data_fetcher import fetch_historical_data
 from src.data.data_preprocessor import preprocess_data
 from src.constants import FEATURE_COLUMNS
 from src.strategy.backtester import backtest_strategy
-from src.strategy.strategy_generator import generate_signals
+import logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logging.debug(f"numpy version in backtest_visualizer: {__import__('numpy').__version__ if 'numpy' in globals() else 'Not loaded'}")
+import src.strategy.strategy_generator as strategy_generator  # Changed to import the entire module
 from src.strategy.market_regime import detect_market_regime
 from src.strategy.position_sizer import calculate_position_size
 from src.strategy.risk_manager import manage_risk
+import importlib
 
 if sys.platform == "win32":
     import winloop
@@ -74,24 +75,55 @@ def plot_backtest_results(results):
     plt.show()
 
 def load_model(model_class):
-    """Load the trained transformer model."""
+    """Load the trained transformer model with enhanced debugging and compatibility checks."""
     model_path = "best_model.pth"
     input_dim = len(FEATURE_COLUMNS)  # 17, matching training
-    hidden_dim = 64  # Match transformer's d_model
-    layer_dim = 2    # Match transformer's n_layers
-
-    if os.path.exists(model_path):
-        try:
-            model = model_class(input_dim=input_dim, d_model=hidden_dim, n_heads=4, n_layers=layer_dim, dropout=0.1).to(device)
-            model.load_state_dict(torch.load(model_path, map_location=device))
-            model.eval()
-            logging.info(f"Loaded model from {model_path} with input_dim={input_dim}")
-            return model
-        except Exception as e:
-            logging.error(f"Error loading model: {e}")
+    model = TransformerPredictor(input_dim=input_dim, d_model=64, n_heads=4, n_layers=2, dropout=0.1).to(device)
+    
+    # Enhanced debugging for model loading, ensuring all logs execute
+    logging.debug(f"Attempting to load model - PyTorch version: {torch.__version__}")
+    logging.debug(f"Attempting to load model from: {os.path.abspath(model_path)}")
+    
+    try:
+        # Check if file exists before attempting to load
+        if not os.path.exists(model_path):
+            logging.error(f"Model file not found at: {os.path.abspath(model_path)}")
             return None
-    logging.warning(f"Model file not found: {model_path}")
-    return None
+        
+        logging.debug(f"Model path exists: {os.path.exists(model_path)}")
+        logging.debug(f"Model input_dim: {input_dim}, device: {device}")
+        
+        # Attempt to load state dict with detailed logging
+        state_dict = torch.load(model_path, map_location=device)
+        logging.debug(f"Loaded state dict keys: {list(state_dict.keys())}")
+        
+        # Try loading with strict=False to handle potential mismatches, logging any issues
+        try:
+            model.load_state_dict(state_dict, strict=False)
+            logging.debug("Model state dict loaded successfully with strict=False")
+        except RuntimeError as e:
+            logging.error(f"Partial load failed - state dict mismatch: {e}")
+            # Try to identify mismatched keys
+            model_dict = model.state_dict()
+            missing_keys = [k for k in state_dict.keys() if k not in model_dict]
+            unexpected_keys = [k for k in model_dict.keys() if k not in state_dict]
+            logging.debug(f"Missing keys: {missing_keys}")
+            logging.debug(f"Unexpected keys: {unexpected_keys}")
+            return None
+        
+        model.eval()
+        logging.info(f"Loaded model from {model_path} with input_dim={input_dim}")
+        return model
+    
+    except FileNotFoundError as e:
+        logging.error(f"Model file not found: {e}")
+        return None
+    except RuntimeError as e:
+        logging.error(f"Error loading state dict: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error loading model: {e}")
+        return None
 
 def filter_signals(signal_data, min_hold_period=5):
     """Filter signals to enforce minimum hold period."""
@@ -125,19 +157,24 @@ async def main():
         logging.info(f"Preprocessed data shape: {preprocessed_data.shape}")
 
         # Load model
-        model = load_model(LSTMModel)
+        model = load_model(TransformerPredictor)
         if model is None:
             raise ValueError("Model loading failed.")
 
         # Prepare scaled data with all training features
         feature_scaler = joblib.load('feature_scaler.pkl')
         target_scaler = joblib.load('target_scaler.pkl')
-        train_columns = FEATURE_COLUMNS + ['target']  # 18 columns total
-        scaled_data = feature_scaler.transform(preprocessed_data[FEATURE_COLUMNS])  # 17 features
+        train_columns = FEATURE_COLUMNS + ['target']
+        
+        # Ensure feature names match during scaling (if MinMaxScaler was fitted with feature names)
+        if hasattr(feature_scaler, 'feature_names_in_') and feature_scaler.feature_names_in_ is not None:
+            scaled_data = feature_scaler.transform(preprocessed_data[FEATURE_COLUMNS])
+        else:
+            scaled_data = feature_scaler.transform(preprocessed_data[FEATURE_COLUMNS].values)
         scaled_df = pd.DataFrame(scaled_data, columns=FEATURE_COLUMNS, index=preprocessed_data.index)
-        scaled_df['target'] = target_scaler.transform(preprocessed_data[['target']])  # Add scaled target
-        scaled_df['close'] = preprocessed_data['close']  # Unscaled close for backtesting
-        scaled_df['price_volatility'] = preprocessed_data['price_volatility']  # Add unscaled price_volatility
+        scaled_df['target'] = target_scaler.transform(preprocessed_data[['target']])
+        scaled_df['close'] = preprocessed_data['close']
+        scaled_df['price_volatility'] = preprocessed_data['price_volatility']
         logging.info(f"Scaled DataFrame columns: {scaled_df.columns}")
 
         # Market regime and signals
@@ -152,7 +189,13 @@ async def main():
         }
         params = regime_params.get(regime, {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2, 'max_risk_pct': 0.05})
 
-        signal_data = generate_signals(scaled_df, model, train_columns, feature_scaler, target_scaler, **params)
+        # Force reload of strategy_generator to bypass caching issues
+        importlib.reload(strategy_generator)
+
+        signal_data = strategy_generator.generate_signals(scaled_df, model, train_columns, feature_scaler, target_scaler, 
+                                                        rsi_threshold=params['rsi_threshold'], macd_fast=params['macd_fast'], 
+                                                        macd_slow=params['macd_slow'], atr_multiplier=params['atr_multiplier'], 
+                                                        max_risk_pct=params['max_risk_pct'])
         logging.info(f"Signal data columns before filtering: {signal_data.columns.tolist()}")
         signal_data = filter_signals(signal_data, min_hold_period=5)
 

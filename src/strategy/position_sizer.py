@@ -21,7 +21,7 @@ def calculate_position_size(current_balance, atr, last_close, max_risk_pct=0.1):
         logging.error(f"Error in position size calculation: {e}")
         return 0
 
-def kelly_criterion(win_rate, risk_reward_ratio, current_balance, atr, last_close, max_risk_pct=0.1):
+def kelly_criterion(win_rate, risk_reward_ratio, current_balance, atr, last_close, max_risk_pct=0.05):
     """Calculate optimal position size using Kelly Criterion."""
     try:
         if not (0 <= win_rate <= 1) or risk_reward_ratio <= 0 or current_balance <= 0:

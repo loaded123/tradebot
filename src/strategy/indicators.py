@@ -32,6 +32,27 @@ def compute_bollinger_bands(df, period=20, std_dev=2):
     except Exception as e:
         logging.error(f"Bollinger Bands computation failed: {e}")
         return pd.DataFrame(index=df.index)
+    
+def calculate_rsi(prices, window=14):
+    """Calculate Relative Strength Index (RSI)."""
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """Calculate MACD (Moving Average Convergence Divergence)."""
+    exp1 = prices.ewm(span=fast, adjust=False).mean()
+    exp2 = prices.ewm(span=slow, adjust=False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    return macd - signal_line
+
+def calculate_atr(high, low, close, window=14):
+    """Calculate Average True Range (ATR)."""
+    tr = np.maximum(high - low, np.abs(high - close.shift()), np.abs(low - close.shift()))
+    return tr.rolling(window=window).mean()
 
 if __name__ == "__main__":
     # Test with dummy data

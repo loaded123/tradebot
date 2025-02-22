@@ -1,11 +1,13 @@
-coinbase
-pandas
-numpy
-torch
-scikit-learn
-ta
-flask
-schedule
-asyncio
-websockets
-ccxt
+numpy==1.26.4  # Compatible with pandas-ta, torch, and scikit-learn 1.x
+pandas>=2.0.0  # Ensure compatibility with NumPy 1.26.4 and pandas-ta
+pandas-ta>=0.3.14b  # Latest version compatible with NumPy 1.x (check for updates if needed)
+torch>=2.2.0  # PyTorch version compatible with NumPy 1.26.4 (adjust based on your installed version)
+torchvision>=0.17.0  # Optional, for PyTorch vision utilities
+torchaudio>=2.2.0  # Optional, for PyTorch audio utilities
+scikit-learn>=1.3.0  # Compatible with NumPy 1.26.4 (adjust based on your scaler version)
+joblib>=1.3.0  # For saving/loading scalers and models
+matplotlib>=3.7.0  # For visualizations in backtesting
+seaborn>=0.12.0  # For visualizations in backtesting
+asyncio>=3.4.3  # Ensure compatibility with Python 3.11 and winloop
+winloop>=1.0.0  # For Windows asyncio compatibility (if required)
+transformers>=4.49.0  # For TimeSeriesTransformerModel, compatible with PyTorch and NumPy 1.x

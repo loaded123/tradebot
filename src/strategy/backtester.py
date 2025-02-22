@@ -82,7 +82,19 @@ def backtest_strategy(signal_data, initial_capital=10000, transaction_cost=0.001
             })
         
         df_results = pd.DataFrame(results).set_index('date')
+    
+        # Additional metrics
+        daily_returns = df_results['returns'].dropna()
+        sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() != 0 else 0
+        max_drawdown = (df_results['total'] / df_results['total'].cummax() - 1).min() * 100  # In percentage
+        trades = len(df_results[df_results['signal'] != 0])
+        wins = len(df_results[(df_results['signal'] == 1) & (df_results['returns'] > 0)]) + len(df_results[(df_results['signal'] == -1) & (df_results['returns'] < 0)])
+        losses = trades - wins
+        win_loss_ratio = wins / losses if losses > 0 else float('inf')
+        
         logging.info(f"Backtest completed. Final portfolio value: {df_results['total'].iloc[-1]:.2f}")
+        logging.info(f"Sharpe Ratio: {sharpe_ratio:.2f}, Max Drawdown: {max_drawdown:.2f}%, Trades: {trades}, Win/Loss Ratio: {win_loss_ratio:.2f}")
+        
         return df_results
     
     except Exception as e:
