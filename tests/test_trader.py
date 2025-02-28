@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from trading.trader import execute_trade
+from trading.trader_new import execute_trade
 
 @pytest.mark.asyncio
 async def test_execute_trade_buy():

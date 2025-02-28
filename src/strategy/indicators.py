@@ -3,6 +3,7 @@
 import pandas as pd
 import pandas_ta as ta
 import logging
+import numpy as np  # Added import for NumPy
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 

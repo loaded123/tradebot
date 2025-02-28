@@ -1,7 +1,6 @@
 # src/strategy/risk_manager.py
 
 import pandas as pd
-import numpy as np
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
@@ -29,16 +28,17 @@ def manage_risk(df, current_balance, max_drawdown_pct=0.1, atr_multiplier=1.5, r
         df = df.copy()
         equity_curve = df['total']
         max_equity = equity_curve.cummax()
-        drawdown = (equity_curve - max_equity) / max_equity
+        drawdown = (equity_curve - max_equity) / max_equity if max_equity.max() != 0 else pd.Series(0, index=df.index)
         position_value = 0  # Track current position value in USD
         last_drawdown_date = None
         
-        for i, row in df.iterrows():
-            date = df.index[i]
-            atr = row['atr']
-            last_close = row['close']
-            signal = row['signal']
-            volatility = row['price_volatility']
+        # Use iloc for iteration over rows
+        for i in range(len(df)):
+            date = df.index[i]  # Get date from index
+            atr = df.iloc[i]['atr']
+            last_close = df.iloc[i]['close']
+            signal = df.iloc[i]['signal']
+            volatility = df.iloc[i]['price_volatility']
             
             # Dynamic ATR multiplier adjustment based on volatility
             dynamic_atr_mult = atr_multiplier * (1 + volatility / df['price_volatility'].mean()) if volatility > 0 else atr_multiplier

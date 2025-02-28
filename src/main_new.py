@@ -7,7 +7,7 @@ from models.model_trainer import train_model
 from models.model_predictor import predict_live_price
 from strategy.strategy_generator import generate_signals
 from strategy.backtester import backtest_strategy
-from trading.trader import execute_trade
+from trading.trader_new import execute_trade
 from utils.config import Config
 from utils.logger import logger
 from utils.performance import PerformanceTracker

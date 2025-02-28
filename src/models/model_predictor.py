@@ -2,16 +2,79 @@
 
 import torch
 import numpy as np
+import pandas as pd
 import logging
+import asyncio
 from sklearn.preprocessing import MinMaxScaler
 from src.constants import FEATURE_COLUMNS
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 
-from src.models.transformer_model import TransformerPredictor  # Updated import
+from src.models.transformer_model import TransformerPredictor  # Maintained import
 
-def predict_next_movement(model, data_slice, feature_columns, feature_scaler, target_scaler, 
-                         time_steps=10, threshold=0.001):
+async def predict_live_price(model, current_data: np.ndarray, feature_columns: list, feature_scaler: MinMaxScaler, target_scaler: MinMaxScaler, time_steps: int = 1) -> float:
+    """
+    Asynchronously predict the next price for real-time trading using a trained model.
+    
+    Args:
+        model: Trained model (TransformerPredictor)
+        current_data (np.ndarray): Current price data [[price]] or [time_steps, features]
+        feature_columns (list): List of feature column names
+        feature_scaler (MinMaxScaler): Scaler for features
+        target_scaler (MinMaxScaler): Scaler for target (price)
+        time_steps (int): Number of time steps for prediction (default 1 for real-time)
+    
+    Returns:
+        float: Predicted next price
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    try:
+        # Ensure current_data is 2D (even for single time step)
+        if len(current_data.shape) == 1:
+            current_data = current_data.reshape(1, -1)
+        if current_data.shape[1] != len(feature_columns):
+            raise ValueError(f"Current data must have {len(feature_columns)} features, got {current_data.shape[1]}")
+
+        # Scale features
+        features_scaled = feature_scaler.transform(current_data)
+        
+        # Prepare data for the model (TransformerPredictor)
+        features_tensor = torch.FloatTensor(features_scaled).unsqueeze(0).to(device)  # Shape: [1, 1, len(feature_columns)]
+        past_time_features = torch.zeros(1, 1, 1).to(device)  # Dummy time index for real-time
+        past_observed_mask = torch.ones(1, 1).to(device)  # All observed
+        future_values = None  # No future values for real-time
+        
+        model.eval()
+        with torch.no_grad():
+            prediction_scaled = model(features_tensor, past_time_features, past_observed_mask, None, future_values).cpu().numpy()  # Shape: [1, 1]
+
+        # Inverse transform to get the predicted price
+        predicted_price = target_scaler.inverse_transform(prediction_scaled)[0, 0]
+        logging.debug(f"Predicted live price: {predicted_price:.2f}")
+        return predicted_price
+
+    except Exception as e:
+        logging.error(f"Error in predict_live_price: {e}")
+        return np.nan
+
+def predict_next_movement(model, data_slice: pd.DataFrame, feature_columns: list, feature_scaler: MinMaxScaler, target_scaler: MinMaxScaler, 
+                         time_steps: int = 10, threshold: float = 0.001):
+    """
+    Predict the next price movement direction for backtesting using a trained model.
+    
+    Args:
+        model: Trained model (TransformerPredictor)
+        data_slice (pd.DataFrame): Historical data slice with time_steps rows
+        feature_columns (list): List of feature column names
+        feature_scaler (MinMaxScaler): Scaler for features
+        target_scaler (MinMaxScaler): Scaler for target (price)
+        time_steps (int): Number of time steps for prediction (default 10 for backtesting)
+        threshold (float): Threshold for determining movement direction
+    
+    Returns:
+        str: 'up', 'down', or 'neutral' based on price change
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     try:
@@ -24,17 +87,17 @@ def predict_next_movement(model, data_slice, feature_columns, feature_scaler, ta
         # Prepare features (17 features)
         features = data_slice[feature_columns].values  # Shape: [time_steps, 17]
         features_scaled = feature_scaler.transform(features)  # Shape: [time_steps, 17]
+        
+        # Prepare data for the model (TransformerPredictor)
         features_tensor = torch.FloatTensor(features_scaled).unsqueeze(0).to(device)  # Shape: [1, time_steps, 17]
-        
-        # Generate dummy past_time_features and past_observed_mask
         past_time_features = torch.zeros(1, time_steps, 1).to(device)  # Dummy time index
-        past_observed_mask = torch.ones(1, time_steps).to(device)       # All observed
+        past_observed_mask = torch.ones(1, time_steps).to(device)  # All observed
+        future_values = None  # No future values for backtesting
         
-        # Predict
         model.eval()
         with torch.no_grad():
-            prediction_scaled = model(features_tensor, past_time_features, past_observed_mask).cpu().numpy()  # Shape: [1, 1]
-        
+            prediction_scaled = model(features_tensor, past_time_features, past_observed_mask, None, future_values).cpu().numpy()  # Shape: [1, 1]
+
         # Inverse transform and calculate change
         predicted_price = target_scaler.inverse_transform(prediction_scaled)[0, 0]
         current_price = data_slice['close'].iloc[-1]
@@ -55,8 +118,7 @@ def predict_next_movement(model, data_slice, feature_columns, feature_scaler, ta
         return 'neutral'
 
 if __name__ == "__main__":
-    # Dummy test
-    from src.models.lstm_model import LSTMModel
+    # Dummy test for both functions
     dummy_data = pd.DataFrame({
         'close': np.linspace(100, 110, 10),
         'open': [100] * 10,
@@ -76,8 +138,17 @@ if __name__ == "__main__":
         'bollinger_upper': [102] * 10,
         'bollinger_lower': [98] * 10
     })
-    model = LSTMModel(input_dim=17)  # Updated input_dim
-    scaler = MinMaxScaler()
-    scaler.fit(dummy_data[FEATURE_COLUMNS])
-    pred = predict_next_movement(model, dummy_data, FEATURE_COLUMNS, scaler, scaler)
-    print(f"Prediction: {pred}")
+    model = TransformerPredictor(input_dim=17, context_length=10)  # Updated for Transformer with context_length
+    feature_scaler = MinMaxScaler()
+    target_scaler = MinMaxScaler()
+    feature_scaler.fit(dummy_data[FEATURE_COLUMNS])
+    target_scaler.fit(dummy_data[['close']])
+    
+    # Test predict_live_price
+    current_data = np.array([[110]])  # Single price for real-time
+    pred_price = asyncio.run(predict_live_price(model, current_data, FEATURE_COLUMNS, feature_scaler, target_scaler))
+    print(f"Predicted live price: {pred_price:.2f}")
+    
+    # Test predict_next_movement
+    pred_movement = predict_next_movement(model, dummy_data, FEATURE_COLUMNS, feature_scaler, target_scaler)
+    print(f"Predicted movement: {pred_movement}")

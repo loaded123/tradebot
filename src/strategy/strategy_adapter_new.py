@@ -1,26 +1,27 @@
+# src/strategy/strategy_adapter_new.py
 import pandas as pd
 from src.data.data_preprocessor import FEATURE_COLUMNS
 from sklearn.linear_model import LinearRegression
+import numpy as np
+import logging
 
 def calculate_market_regime(df, window=50):
-    """
-    Estimate market regime using a rolling linear regression slope.
-    """
-    df['regime'] = df['close'].rolling(window).apply(lambda x: LinearRegression().fit(range(window), x).coef_[0], raw=True)
+    """Estimate market regime using a rolling linear regression slope."""
+    X = np.arange(window).reshape(-1, 1)
+    df['regime'] = df['close'].rolling(window).apply(
+        lambda x: LinearRegression().fit(X, x).coef_[0], raw=True
+    )
     return df
 
 def adapt_strategy_parameters(df, window=30):
-    """
-    Adapt strategy parameters based on recent market volatility and regime.
-
-    :param df: DataFrame with preprocessed data
-    :param window: Rolling window for calculating volatility
-    :return: Dictionary of adapted parameters
-    """
+    """Adapt strategy parameters based on recent market volatility and regime."""
     df = calculate_market_regime(df, window)
-
     volatility = df['price_volatility'].rolling(window=window).mean().iloc[-1]
-    bollinger_bandwidth = (df['upper_band'] - df['lower_band']) / df['middle_band']
+    try:
+        bollinger_bandwidth = (df['bollinger_upper'] - df['bollinger_lower']) / df['bollinger_middle']
+    except KeyError:
+        logging.debug("Missing 'bollinger_middle', using 'sma_20' as proxy")
+        bollinger_bandwidth = (df['bollinger_upper'] - df['bollinger_lower']) / df['sma_20']
     market_regime = df['regime'].iloc[-1]
 
     params = {
@@ -30,5 +31,4 @@ def adapt_strategy_parameters(df, window=30):
         'atr_multiplier': 3 if bollinger_bandwidth.iloc[-1] > bollinger_bandwidth.mean() else 2,
         'max_risk_pct': 0.015 if volatility > df['price_volatility'].mean() else 0.02
     }
-    
     return params
