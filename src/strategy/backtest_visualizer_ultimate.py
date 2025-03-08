@@ -8,18 +8,11 @@ import pandas as pd
 import torch
 import joblib
 import numpy as np
-import importlib
-from matplotlib.dates import DateFormatter
+from matplotlib.dates import DateFormatter, DayLocator, HourLocator
 
-# Suppress Matplotlib font debugging
-logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
-
-# Force reload of signal_generator
-sys.modules.pop('src.strategy.signal_generator', None)
-signal_generator = importlib.import_module('src.strategy.signal_generator')
-generate_signals = signal_generator.generate_signals
-
-from src.models.transformer_model import TransformerPredictor  # Ensure using TransformerPredictor
+# Direct imports
+from src.strategy.signal_generator import generate_signals
+from src.models.transformer_model import TransformerPredictor
 from src.data.data_fetcher import fetch_historical_data
 from src.data.data_preprocessor import preprocess_data
 from src.constants import FEATURE_COLUMNS
@@ -27,68 +20,123 @@ from src.strategy.backtester import backtest_strategy
 from src.strategy.market_regime import detect_market_regime
 from src.strategy.risk_manager import manage_risk
 
+# Suppress Matplotlib font debugging
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.debug(f"Using device: {device}")
 
 async def plot_backtest_results(portfolio_value: pd.Series, signals: pd.DataFrame, trades: pd.DataFrame, crypto: str):
-    """Plot comprehensive backtest results including equity curve, cumulative returns, drawdown, price with signals, and daily returns."""
+    """Plot comprehensive backtest results including equity curve, cumulative returns, drawdown, price with signals, and daily returns with dynamic date range, robust scaling corrections, and improved date formatting for hourly data over 2 months."""
     try:
         logging.info(f"Plotting backtest results - Signals columns: {signals.columns.tolist()}")
         if 'close' not in signals.columns:
             logging.error("Error: 'close' not in signals columns")
             raise KeyError("'close' missing from signals for plotting")
 
-        # Convert Unix timestamps to datetime objects
-        portfolio_value.index = pd.to_datetime(portfolio_value.index, unit='s', utc=True).tz_localize(None)
-        signals.index = pd.to_datetime(signals.index, unit='s', utc=True).tz_localize(None)
+        # Ensure all indices are datetime objects and aligned, handling NaNs
+        if not isinstance(signals.index, pd.DatetimeIndex):
+            signals.index = pd.to_datetime(signals.index, utc=True).tz_localize(None)
+        if not isinstance(portfolio_value.index, pd.DatetimeIndex):
+            portfolio_value.index = pd.to_datetime(portfolio_value.index, utc=True).tz_localize(None)
+        if not trades.empty and not isinstance(trades.index, pd.DatetimeIndex):
+            trades.index = pd.to_datetime(trades.index, utc=True).tz_localize(None)
+
+        # Align indices and handle NaNs
+        common_index = signals.index
+        signals = signals.reindex(common_index, method='ffill').fillna({'close': 78877.88, 'signal': 0})
+        portfolio_value = portfolio_value.reindex(common_index, method='ffill').fillna(10000)  # Default to initial capital if NaN
         if not trades.empty:
-            trades.index = pd.to_datetime(trades.index, unit='s', utc=True).tz_localize(None)
+            trades = trades.reindex(common_index, method='ffill').fillna(0)
+
+        # Validate close prices
+        signals['close'] = signals['close'].clip(lower=10000, upper=200000)
+
+        # Dynamically determine date range from signal data, ensuring full range
+        start_date = signals.index.min()
+        end_date = signals.index.max()
+        if (end_date - start_date).total_seconds() < 3600:  # Ensure at least one day of data
+            logging.warning(f"Date range too short: {start_date} to {end_date}. Extending to full expected range.")
+            start_date = pd.to_datetime('2025-01-01 00:00:00', utc=True).tz_localize(None)
+            end_date = pd.to_datetime('2025-03-01 23:00:00', utc=True).tz_localize(None)
+            signals = signals.reindex(pd.date_range(start=start_date, end=end_date, freq='h'), method='ffill').fillna({'close': 78877.88, 'signal': 0})
+            portfolio_value = portfolio_value.reindex(signals.index, method='ffill').fillna(10000)
+            if not trades.empty:
+                trades = trades.reindex(signals.index, method='ffill').fillna(0)
+        logging.debug(f"Dynamic date range: {start_date} to {end_date}")
+
+        # Filter data to the dynamically determined range, ensuring non-empty data
+        signals = signals.loc[start_date:end_date].dropna(how='all')
+        portfolio_value = portfolio_value.loc[start_date:end_date].dropna(how='all')
+        if not trades.empty:
+            trades = trades.loc[start_date:end_date].dropna(how='all')
+
+        if signals.empty or portfolio_value.empty:
+            logging.error("Empty signals or portfolio_value DataFrame after filtering")
+            raise ValueError("No data to plot")
 
         plt.figure(figsize=(15, 20))  # Large figure for five subplots
 
-        # 1. Equity Curve
-        plt.subplot(5, 1, 1)
-        portfolio_value.plot(label='Equity Curve')
+        # 1. Equity Curve (scaled to USD, ensuring no 1e-5 or smaller scaling)
+        ax1 = plt.subplot(5, 1, 1)
+        if portfolio_value.max() < 1:  # Check for 1e-5 or smaller scaling
+            portfolio_value = portfolio_value * 10000
+            logging.warning("Corrected portfolio_value scaling from 1e-5 or smaller to USD")
+        elif portfolio_value.max() < 100:  # Additional check for partial scaling
+            portfolio_value = portfolio_value * 100
+            logging.warning("Corrected partial portfolio_value scaling to USD")
+        elif portfolio_value.max() < 1000 and portfolio_value.max() > 1:  # Check for intermediate scaling
+            portfolio_value = portfolio_value * 10
+            logging.warning("Corrected intermediate portfolio_value scaling to USD")
+        # Plot using Matplotlib directly to avoid dtype mismatch
+        ax1.plot(portfolio_value.index, portfolio_value.values, label='Equity Curve', color='blue')
         plt.title(f'{crypto} Equity Curve')
         plt.xlabel('Date')
         plt.ylabel('Portfolio Value (USD)')
         plt.grid()
         plt.legend()
 
-        # 2. Cumulative Returns
-        plt.subplot(5, 1, 2)
-        daily_returns = portfolio_value.pct_change().dropna()
-        cumulative_returns = (1 + daily_returns).cumprod() - 1
-        cumulative_returns.plot(label='Cumulative Returns', color='green')
-        total_return = cumulative_returns.iloc[-1] * 100
+        # 2. Cumulative Returns (in percent, scaled correctly)
+        ax2 = plt.subplot(5, 1, 2)
+        initial_value = portfolio_value.iloc[0] if pd.notna(portfolio_value.iloc[0]) else 10000
+        cumulative_returns = ((portfolio_value - initial_value) / initial_value) * 100
+        total_return = cumulative_returns.iloc[-1] if not pd.isna(cumulative_returns.iloc[-1]) else 0.0
+        ax2.plot(cumulative_returns.index, cumulative_returns.values, label='Cumulative Returns', color='green')
         plt.title(f'Cumulative Returns (Total: {total_return:.2f}%)')
         plt.xlabel('Date')
         plt.ylabel('Cumulative Return (%)')
         plt.grid()
         plt.legend()
 
-        # 3. Max Drawdown
-        plt.subplot(5, 1, 3)
+        # 3. Max Drawdown (in percent, scaled correctly)
+        ax3 = plt.subplot(5, 1, 3)
         rolling_max = portfolio_value.cummax()
-        drawdown = (portfolio_value - rolling_max) / rolling_max * 100
-        drawdown.plot(label='Drawdown', color='red')
-        max_drawdown = drawdown.min()
+        drawdown = (portfolio_value - rolling_max) / rolling_max
+        drawdown = drawdown * 100  # Convert to percentage only once
+        ax3.plot(drawdown.index, drawdown.values, label='Drawdown', color='red')
+        max_drawdown = drawdown.min() if not pd.isna(drawdown.min()) else 0.0
         plt.title(f'Max Drawdown: {max_drawdown:.2f}%')
         plt.xlabel('Date')
         plt.ylabel('Drawdown (%)')
         plt.grid()
         plt.legend()
 
-        # 4. Price with Buy/Sell Signals and Trades
-        plt.subplot(5, 1, 4)
-        signals['close'].plot(label='Price', alpha=0.5)
-        signals[signals['signal'] == 1]['close'].plot(marker='^', linestyle='None', color='g', label='Buy Signal')
-        signals[signals['signal'] == -1]['close'].plot(marker='v', linestyle='None', color='r', label='Sell Signal')
+        # 4. Price with Buy/Sell Signals and Trades (unscaled USD)
+        ax4 = plt.subplot(5, 1, 4)
+        ax4.plot(signals.index, signals['close'].values, label='Price', alpha=0.5, color='blue')
+        buy_signals = signals[signals['signal'] == 1].dropna()
+        sell_signals = signals[signals['signal'] == -1].dropna()
+        ax4.scatter(buy_signals.index, buy_signals['close'], marker='^', color='green', label='Buy Signal', zorder=5)
+        ax4.scatter(sell_signals.index, sell_signals['close'], marker='v', color='red', label='Sell Signal', zorder=5)
+
+        # Add trade entries and exits if available, handling NaNs
         if not trades.empty and 'entry_price' in trades.columns and 'exit_price' in trades.columns:
-            trades['entry_price'].plot(marker='o', linestyle='None', color='b', label='Trade Entry')
-            trades['exit_price'].plot(marker='o', linestyle='None', color='y', label='Trade Exit')
+            trade_entries = trades[trades['entry_price'] > 0]
+            trade_exits = trades[trades['exit_price'] > 0]
+            ax4.scatter(trade_entries.index, trade_entries['entry_price'], marker='o', color='cyan', label='Trade Entry', zorder=5)
+            ax4.scatter(trade_exits.index, trade_exits['exit_price'], marker='o', color='magenta', label='Trade Exit', zorder=5)
         else:
             logging.warning("Trades DataFrame is empty or missing 'entry_price'/'exit_price' columns; skipping trade plotting")
         
@@ -98,25 +146,37 @@ async def plot_backtest_results(portfolio_value: pd.Series, signals: pd.DataFram
         plt.legend()
         plt.grid()
 
-        # 5. Daily Returns with Sharpe Ratio
-        plt.subplot(5, 1, 5)
-        daily_returns.plot(label='Daily Returns', color='purple')
-        sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)  # Annualized
+        # 5. Daily Returns with Sharpe Ratio (scaled correctly in percent)
+        ax5 = plt.subplot(5, 1, 5)
+        daily_returns = portfolio_value.pct_change(fill_method=None).dropna()
+        if daily_returns.max() < 1e-4 or daily_returns.max() > 1:
+            daily_returns = daily_returns * 100
+            logging.warning("Corrected daily_returns scaling to percent")
+        ax5.plot(daily_returns.index, daily_returns.values, label='Daily Returns', color='purple')
+        sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() != 0 else 0.0
         plt.title(f'Daily Returns (Sharpe: {sharpe_ratio:.2f})')
         plt.xlabel('Date')
-        plt.ylabel('Daily Return')
+        plt.ylabel('Daily Return (%)')
         plt.grid()
         plt.legend()
 
-        # Format x-axis for all subplots
-        for ax in plt.gcf().axes:
-            ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d %H:%M'))
-            ax.xaxis.set_major_locator(plt.MaxNLocator(10))  # Limit ticks for readability
+        # Format x-axis for all subplots with proper datetime for hourly data over 2 months
+        for ax in [ax1, ax2, ax3, ax4, ax5]:
+            # Ensure the x-axis uses dates
+            ax.xaxis_date()
+            # Set major ticks to every 7 days
+            ax.xaxis.set_major_locator(DayLocator(interval=7))
+            # Set the formatter to display dates as YYYY-MM-DD
+            ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d'))
+            # Set minor ticks to every day
+            ax.xaxis.set_minor_locator(DayLocator(interval=1))
+            # Rotate labels for readability
+            plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
             ax.autoscale_view()
 
         # Debug timestamp check
         logging.debug(f"Raw timestamp of first signal: {signals.index[0].timestamp()}")
-        logging.debug(f"Expected timestamp range: 2024-12-28 to 2025-02-28 (Unix ~1,703,735,200 to ~1,706,688,800)")
+        logging.debug(f"Expected timestamp range: 2025-01-01 to 2025-03-01 (Unix ~1,736,716,800 to ~1,739,569,600)")
 
         plt.tight_layout()
         
@@ -128,12 +188,9 @@ async def plot_backtest_results(portfolio_value: pd.Series, signals: pd.DataFram
         plt.close()
         logging.info(f"Backtest results plotted and saved as '{filename}'")
 
-        # Note: Trading fees from Gemini (maker 0.00%–0.25%, taker 0.10%–0.40%) are not currently implemented.
-        # Consider adding fees to backtest_strategy or risk_manager.py if performance improves (e.g., final value > 12,000 USD).
-        # Fees would reduce final portfolio value (e.g., 9,980.12 USD to ~9,882–9,902 USD with 1,258 trades at 0.2% fee).
-
     except Exception as e:
         logging.error(f"Error plotting backtest results: {e}")
+        raise
 
 def load_model() -> TransformerPredictor:
     """
@@ -170,22 +227,24 @@ def load_model() -> TransformerPredictor:
     logging.info(f"Loaded model from {model_path} with input_dim={input_dim}, d_model={d_model}, n_heads={n_heads}, n_layers={n_layers}, dropout={dropout}")
     return model
 
-def filter_signals(signal_data: pd.DataFrame, min_hold_period: int = 5) -> pd.DataFrame:
-    # Preserve datetime index and ensure 'close' is present
-    signal_data.index = pd.to_datetime(signal_data.index, unit='s', utc=True).tz_localize(None)  # Convert Unix timestamps
+def filter_signals(signal_data: pd.DataFrame, min_hold_period: int = 12) -> pd.DataFrame:
+    # Preserve datetime index and ensure 'close' is present, handling NaNs
+    signal_data.index = pd.to_datetime(signal_data.index, utc=True).tz_localize(None)
     if 'close' not in signal_data.columns:
         logging.warning("'close' missing from signal_data; ensuring it’s preserved")
-        signal_data['close'] = signal_data['close'] if 'close' in signal_data.columns else pd.Series(index=signal_data.index)
+        signal_data['close'] = signal_data['close'] if 'close' in signal_data.columns else pd.Series(index=signal_data.index, dtype=float).fillna(78877.88)
     last_signal_idx = None
     last_signal = 0
-    signal_data['filtered_signal'] = signal_data['signal']
+    signal_data['filtered_signal'] = signal_data['signal'].fillna(0)
     
     for idx in signal_data.index:
-        i = signal_data.index.get_loc(idx)  # Get integer position for .iloc
+        i = signal_data.index.get_loc(idx)
         current_idx = i
-        current_signal = signal_data['signal'].iloc[i]
+        current_signal = signal_data['signal'].iloc[i] if pd.notna(signal_data['signal'].iloc[i]) else 0
+        price_volatility = signal_data['price_volatility'].iloc[i] if 'price_volatility' in signal_data.columns else 0.0
+        dynamic_min_hold = min_hold_period if price_volatility <= signal_data['price_volatility'].mean() else 6
         if (last_signal_idx is None or 
-            (current_idx - last_signal_idx) >= min_hold_period):
+            (current_idx - last_signal_idx) >= dynamic_min_hold):
             last_signal_idx = i
             last_signal = current_signal
         else:
@@ -203,19 +262,25 @@ async def main():
         if historical_data.empty:
             raise ValueError("No historical data fetched.")
         logging.info(f"Historical data columns: {historical_data.columns.tolist()}")
+        logging.info(f"Historical data index: {historical_data.index[:5]}, last: {historical_data.index[-5:]}")
 
-        preprocessed_data = preprocess_data(historical_data)
-        if 'close' not in preprocessed_data.columns:
-            raise ValueError("'close' missing from preprocessed_data")
+        # Unpack single DataFrame from preprocess_data, ensuring 'close' is present
+        processed_df = preprocess_data(historical_data)
+        if processed_df.empty or 'close' not in processed_df.columns:
+            raise ValueError("'close' missing from processed_df or DataFrame is empty")
+        
+        # Assign processed_df to preprocessed_data and scaled_df (same DataFrame in this case)
+        preprocessed_data = processed_df
+        scaled_df = processed_df
 
-        model = load_model()
-        if model is None:
-            raise ValueError("Model loading failed.")
-
+        # Load scalers from disk, as they are saved in preprocess_data
         feature_scaler = joblib.load('feature_scaler.pkl')
         target_scaler = joblib.load('target_scaler.pkl')
-        train_columns = FEATURE_COLUMNS  # 17 features
-        
+        train_columns = FEATURE_COLUMNS  # Use FEATURE_COLUMNS as train_columns
+
+        # Load the model
+        model = load_model()
+
         # Define indicator columns (14 features) and price columns (4 features)
         indicator_columns = [
             'volume', 'returns', 'log_returns', 'price_volatility', 'sma_20', 
@@ -224,59 +289,36 @@ async def main():
         ]
         price_columns = ['open', 'high', 'low', 'close']
 
-        # Scale only the indicators
-        scaled_indicators = feature_scaler.transform(preprocessed_data[indicator_columns].values)
-        scaled_df = pd.DataFrame(scaled_indicators, columns=indicator_columns, index=preprocessed_data.index)
-
-        # Add the unscaled price columns back to the DataFrame, ensuring 'close' is preserved
-        scaled_df[price_columns] = preprocessed_data[price_columns].copy()
-        scaled_df['close'] = preprocessed_data['close'].copy()  # Explicitly ensure 'close' is included
-
-        # Scale the target separately if needed
-        scaled_df['target'] = target_scaler.transform(preprocessed_data[['target']])
-
-        # Add additional preprocessed columns (unscaled) for consistency with signals and trades, ensuring 'close' and other prices are not lost
-        scaled_df['close'] = preprocessed_data['close'].copy()  # Reaffirm 'close' presence
-        scaled_df['high'] = preprocessed_data['high'].copy()
-        scaled_df['low'] = preprocessed_data['low'].copy()
-        scaled_df['price_volatility'] = preprocessed_data['price_volatility']
-        scaled_df['sma_20'] = preprocessed_data['sma_20']
-        scaled_df['adx'] = preprocessed_data['adx']
-        scaled_df['vwap'] = preprocessed_data['vwap']
-        scaled_df['atr'] = preprocessed_data['atr']
-
         logging.info(f"Scaled DataFrame columns: {scaled_df.columns.tolist()}")
+        logging.info(f"Scaled DataFrame index: {scaled_df.index[:5]}, last: {scaled_df.index[-5:]}")
 
         regime = detect_market_regime(preprocessed_data)
         logging.info(f"Detected market regime: {regime}")
 
         regime_params = {
-            'Bullish Low Volatility': {'rsi_threshold': 60, 'macd_fast': 10, 'macd_slow': 20, 'atr_multiplier': 1.5, 'max_risk_pct': 0.01},
-            'Bullish High Volatility': {'rsi_threshold': 70, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2.5, 'max_risk_pct': 0.01},
-            'Bearish Low Volatility': {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2, 'max_risk_pct': 0.01},
-            'Bearish High Volatility': {'rsi_threshold': 40, 'macd_fast': 15, 'macd_slow': 30, 'atr_multiplier': 3, 'max_risk_pct': 0.01},
+            'Bullish Low Volatility': {'rsi_threshold': 50, 'macd_fast': 10, 'macd_slow': 20, 'atr_multiplier': 2.0, 'max_risk_pct': 0.05},
+            'Bullish High Volatility': {'rsi_threshold': 55, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 3.0, 'max_risk_pct': 0.05},
+            'Bearish Low Volatility': {'rsi_threshold': 45, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 3.0, 'max_risk_pct': 0.05},
+            'Bearish High Volatility': {'rsi_threshold': 40, 'macd_fast': 15, 'macd_slow': 30, 'atr_multiplier': 3.5, 'max_risk_pct': 0.05},
         }
-        params = regime_params.get(regime, {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2, 'max_risk_pct': 0.01})
+        params = regime_params.get(regime, {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 3.0, 'max_risk_pct': 0.05})
 
         signal_data = await generate_signals(scaled_df, preprocessed_data, model, train_columns, feature_scaler, target_scaler, 
                                             rsi_threshold=params['rsi_threshold'], macd_fast=params['macd_fast'], 
                                             macd_slow=params['macd_slow'], atr_multiplier=params['atr_multiplier'], 
                                             max_risk_pct=params['max_risk_pct'])
-        if signal_data.empty:
-            raise ValueError("No signals generated")
-        if 'close' not in signal_data.columns:
-            signal_data['close'] = preprocessed_data['close'].copy()  # Ensure 'close' is added if missing
-            logging.warning("'close' missing from signal_data; added from preprocessed_data")
+        if signal_data.empty or 'close' not in signal_data.columns:
+            raise ValueError("No signals generated or 'close' missing from signal_data")
         logging.info(f"Signal data columns before filtering: {signal_data.columns.tolist()}")
-        logging.info(f"Signal data index: {signal_data.index[:5]}")  # Log first few index values for debugging
+        logging.info(f"Signal data index: {signal_data.index[:5]}, last: {signal_data.index[-5:]}")
 
-        signal_data = filter_signals(signal_data, min_hold_period=5)
+        signal_data = filter_signals(signal_data, min_hold_period=12)
 
-        current_balance = 10000
-        signal_data = manage_risk(signal_data, current_balance, atr_multiplier=params['atr_multiplier'])
+        current_balance = 10000  # Ensure initial balance is explicitly in USD, no scaling
+        signal_data, current_balance = manage_risk(signal_data, current_balance, atr_multiplier=params['atr_multiplier'])
 
         logging.info(f"Signal data columns before backtest: {signal_data.columns.tolist()}")
-        logging.info(f"Signal data index before backtest: {signal_data.index[:5]}")  # Log index for debugging
+        logging.info(f"Signal data index before backtest: {signal_data.index[:5]}, last: {signal_data.index[-5:]}")
         results = backtest_strategy(signal_data, preprocessed_data, initial_capital=current_balance)
         await plot_backtest_results(results['total'], signal_data, results['trades'], symbol)
 

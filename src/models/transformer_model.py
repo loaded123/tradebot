@@ -1,5 +1,4 @@
 # src/models/transformer_model.py
-
 import torch
 import torch.nn as nn
 import logging
@@ -11,6 +10,15 @@ logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(messag
 
 class TransformerPredictor(nn.Module):
     def __init__(self, input_dim=17, d_model=64, n_heads=4, n_layers=2, dropout=0.1, prediction_length=1):
+        """
+        Initialize the Transformer model for time series prediction.
+        input_dim: Number of input features (default 17).
+        d_model: Dimension of the transformer model (default 64).
+        n_heads: Number of attention heads (default 4).
+        n_layers: Number of transformer layers (default 2).
+        dropout: Dropout rate (default 0.1).
+        prediction_length: Length of the prediction horizon (default 1).
+        """
         super(TransformerPredictor, self).__init__()
         try:
             config = TimeSeriesTransformerConfig(
@@ -20,14 +28,14 @@ class TransformerPredictor(nn.Module):
                 n_layers=n_layers,
                 dropout=dropout,
                 prediction_length=prediction_length,
-                context_length=10,  # Match your sequence length
+                context_length=30,  # Reverted to 30 to match past_values length
                 num_time_features=1,
-                lags_sequence=[1, 2, 3]
+                lags_sequence=[1, 2, 3]  # Lags to use for the model
             )
             self.transformer = TimeSeriesTransformerModel(config)
             self.fc = nn.Linear(d_model, 1)  # Predict a single value (univariate target, output [batch_size, 1])
             self.config = config  # Store config for reference
-            logging.info("TimeSeriesTransformerModel initialized successfully with context_length=10 and lags_sequence=[1, 2, 3]")
+            logging.info(f"TimeSeriesTransformerModel initialized successfully with context_length={self.config.context_length} and lags_sequence={self.config.lags_sequence}")
             logging.debug(f"TimeSeriesTransformerConfig: {self.config}")
         except Exception as e:
             logging.error(f"Error initializing TimeSeriesTransformerModel: {e}")
@@ -36,10 +44,10 @@ class TransformerPredictor(nn.Module):
     def forward(self, past_values, past_time_features=None, past_observed_mask=None, future_values=None, future_time_features=None):
         """
         Forward pass for the Transformer model.
-        past_values: [batch, context_length, input_dim] (e.g., [32, 13, 17])
-        past_time_features: [batch, context_length, num_time_features] (e.g., [32, 13, 1])
-        past_observed_mask: [batch, context_length, input_dim] (e.g., [32, 13, 17])
-        future_values: [batch, prediction_length, input_dim] (optional, for training, may be dummy or univariate, e.g., [32, 1, 17])
+        past_values: [batch, context_length, input_dim] (e.g., [32, 30, 17])
+        past_time_features: [batch, context_length, num_time_features] (e.g., [32, 30, 1])
+        past_observed_mask: [batch, context_length, input_dim] (e.g., [32, 30, 17])
+        future_values: [batch, prediction_length, input_dim] (optional, for training, e.g., [32, 1, 17])
         future_time_features: [batch, prediction_length, num_time_features] (e.g., [32, 1, 1])
         """
         try:
@@ -61,31 +69,31 @@ class TransformerPredictor(nn.Module):
 
             # Handle missing or incorrectly shaped past_time_features
             if past_time_features is None:
-                past_time_features = torch.arange(history_length, dtype=torch.float32).repeat(batch_size, 1).unsqueeze(-1).to(device) / history_length
+                past_time_features = torch.arange(self.config.context_length, dtype=torch.float32).repeat(batch_size, 1).unsqueeze(-1).to(device) / self.config.context_length
                 logging.warning("Using dummy past_time_features.")
             elif isinstance(past_time_features, np.ndarray):
                 past_time_features = torch.FloatTensor(past_time_features).to(device)
                 if len(past_time_features.shape) == 2:
                     past_time_features = past_time_features.unsqueeze(-1)  # Shape [batch, context_length, 1]
-                if past_time_features.shape != (batch_size, history_length, 1):
-                    logging.warning(f"Adjusting past_time_features shape from {past_time_features.shape} to [batch, {history_length}, 1]")
-                    past_time_features = past_time_features[:, :history_length, :1]
+                if past_time_features.shape[1] != self.config.context_length:
+                    logging.warning(f"Adjusting past_time_features shape from {past_time_features.shape} to [batch, {self.config.context_length}, 1]")
+                    past_time_features = past_time_features[:, :self.config.context_length, :]
 
             # Handle missing or incorrectly shaped past_observed_mask
             if past_observed_mask is None:
-                past_observed_mask = torch.ones(batch_size, history_length, features).to(device)
+                past_observed_mask = torch.ones(batch_size, self.config.context_length, features).to(device)
                 logging.warning("Using dummy past_observed_mask.")
             elif isinstance(past_observed_mask, np.ndarray):
                 past_observed_mask = torch.FloatTensor(past_observed_mask).to(device)
                 if len(past_observed_mask.shape) == 2:
                     past_observed_mask = past_observed_mask.unsqueeze(-1).repeat(1, 1, features)
-                if past_observed_mask.shape != (batch_size, history_length, features):
-                    logging.warning(f"Adjusting past_observed_mask shape from {past_observed_mask.shape} to [batch, {history_length}, {features}]")
-                    past_observed_mask = past_observed_mask[:, :history_length, :features]
+                if past_observed_mask.shape[1] != self.config.context_length:
+                    logging.warning(f"Adjusting past_observed_mask shape from {past_observed_mask.shape} to [batch, {self.config.context_length}, {features}]")
+                    past_observed_mask = past_observed_mask[:, :self.config.context_length, :features]
 
-            # Handle missing or incorrectly shaped future_values (must match input_dim=17 for concatenation)
+            # Handle missing or incorrectly shaped future_values
             if future_values is None:
-                future_values = torch.zeros(batch_size, self.config.prediction_length, features).to(device)  # Match 17 features
+                future_values = torch.zeros(batch_size, self.config.prediction_length, features).to(device)
                 logging.warning("Using dummy future_values with 17 features.")
             elif isinstance(future_values, np.ndarray):
                 future_values = torch.FloatTensor(future_values).to(device)
@@ -94,18 +102,18 @@ class TransformerPredictor(nn.Module):
 
             # Ensure future_values is 3D [batch_size, prediction_length, features]
             if len(future_values.shape) == 1:  # 1D case (e.g., [batch_size])
-                future_values = future_values.unsqueeze(0).unsqueeze(-1).repeat(1, self.config.prediction_length, features)  # Shape [batch, 1, features]
+                future_values = future_values.unsqueeze(0).unsqueeze(-1).repeat(1, self.config.prediction_length, features)
             elif len(future_values.shape) == 2:  # 2D case (e.g., [batch_size, prediction_length] or [batch_size, 1])
-                future_values = future_values.unsqueeze(-1) if future_values.shape[1] == batch_size else future_values.unsqueeze(1)  # Shape [batch, 1, features] or [batch, prediction_length, 1]
+                future_values = future_values.unsqueeze(-1) if future_values.shape[1] == batch_size else future_values.unsqueeze(1)
             if future_values.shape[2] == 1:  # Univariate target, expand to 17 features
                 logging.warning(f"Adjusting future_values shape from {future_values.shape} to [batch, {self.config.prediction_length}, {features}]")
                 future_values_expanded = torch.zeros(batch_size, self.config.prediction_length, features).to(device)
-                future_values_expanded[:, 0, 0] = future_values.squeeze(-1).squeeze(-1)  # Use first feature for target, rest as zeros
+                future_values_expanded[:, 0, 0] = future_values.squeeze(-1).squeeze(-1)
                 future_values = future_values_expanded
-            elif future_values.shape[2] != features:  # Ensure feature dimension matches input_dim
+            elif future_values.shape[2] != features:
                 logging.warning(f"Adjusting future_values shape from {future_values.shape} to [batch, {self.config.prediction_length}, {features}]")
                 future_values_expanded = torch.zeros(batch_size, self.config.prediction_length, features).to(device)
-                future_values_expanded[:, :, 0] = future_values[:, :, 0] if future_values.shape[2] > 0 else future_values.squeeze(-1)  # Copy first feature, rest as zeros
+                future_values_expanded[:, :, 0] = future_values[:, :, 0] if future_values.shape[2] > 0 else future_values.squeeze(-1)
                 future_values = future_values_expanded
             if future_values.shape != (batch_size, self.config.prediction_length, features):
                 logging.warning(f"Final adjustment of future_values shape from {future_values.shape} to [batch, {self.config.prediction_length}, {features}]")
@@ -118,14 +126,14 @@ class TransformerPredictor(nn.Module):
             elif isinstance(future_time_features, np.ndarray):
                 future_time_features = torch.FloatTensor(future_time_features).to(device)
                 if len(future_time_features.shape) == 2:
-                    future_time_features = future_time_features.unsqueeze(-1)  # Shape [batch, prediction_length, 1]
-                if future_time_features.shape != (batch_size, self.config.prediction_length, 1):
+                    future_time_features = future_time_features.unsqueeze(-1)
+                if future_time_features.shape[1] != self.config.prediction_length:
                     logging.warning(f"Adjusting future_time_features shape from {future_time_features.shape} to [batch, {self.config.prediction_length}, 1]")
                     future_time_features = future_time_features[:, :self.config.prediction_length, :1]
 
             # Verify shapes dynamically
             logging.debug(f"Verified shapes - past_time_features: {past_time_features.shape}, past_observed_mask: {past_observed_mask.shape}, "
-                        f"future_values: {future_values.shape}, future_time_features: {future_time_features.shape}")
+                          f"future_values: {future_values.shape}, future_time_features: {future_time_features.shape}")
 
             # Forward pass
             outputs = self.transformer(
@@ -145,15 +153,15 @@ class TransformerPredictor(nn.Module):
             last_hidden = last_hidden_state[:, -1, :]  # Take the last hidden state for prediction
             logging.debug(f"last_hidden shape before fc: {last_hidden.shape}")
             # Ensure output is [batch_size, 1]
-            output = self.fc(last_hidden)  # Should be [batch_size, 1] from fc
+            output = self.fc(last_hidden)
             if output.shape[1] != 1:
                 logging.error(f"Output shape after fc is unexpected: {output.shape}. Reshaping to [batch_size, 1]")
-                output = output[:, 0:1]  # Force to [batch_size, 1] if multiple outputs
+                output = output[:, 0:1]
             logging.debug(f"Output shape after fc: {output.shape}")
             if len(output.shape) == 1:
-                output = output.unsqueeze(-1)  # Ensure 2D [batch_size, 1]
+                output = output.unsqueeze(-1)
             logging.debug(f"Forward output shape after reshaping: {output.shape}")
-            return output  # Return [batch_size, 1] for consistency
+            return output
 
         except Exception as e:
             logging.error(f"Error in forward pass: {e}")
@@ -451,9 +459,9 @@ class TransformerPredictor(nn.Module):
 if __name__ == "__main__":
     # Dummy test
     model = TransformerPredictor(input_dim=17)
-    sample_input = torch.randn(1, 13, 17)  # Batch of 1, 13 time steps, 17 features
-    past_time_features = torch.zeros(1, 13, 1)
-    past_observed_mask = torch.ones(1, 13, 17)
+    sample_input = torch.randn(1, 30, 17)  # Matches context_length=30
+    past_time_features = torch.zeros(1, 30, 1)
+    past_observed_mask = torch.ones(1, 30, 17)
     future_time_features = torch.zeros(1, 1, 1)
     future_values = torch.zeros(1, 1, 1)  # Univariate target, will be expanded to 17 features
     output = model.predict(sample_input.numpy(), past_time_features.numpy(), past_observed_mask.numpy(), future_time_features.numpy(), future_values.numpy())

@@ -24,12 +24,12 @@ logging.debug(f"Using device: {device}")
 
 def create_sequences(data_features: Union[List, np.ndarray, pd.DataFrame], 
                     data_target: Union[List, np.ndarray, pd.Series], 
-                    seq_length: int = 13, 
+                    seq_length: int = 34,  # Optimal: context_length (30) + max(lags) (3) + prediction_length (1) = 34
                     num_time_features: int = 1, 
                     observed_mask: Optional[Union[List, np.ndarray, pd.DataFrame]] = None):
-    """Create sequences for Transformer input, handling univariate future values separately, ensuring 13-step history without numpy."""
+    """Create sequences for Transformer input, handling univariate future values separately."""
     X, y, time_features, observed_masks, future_values, future_time_features = [], [], [], [], [], []
-    required_history = seq_length  # Enforce exactly 13 steps for consistency
+    required_history = seq_length - 1  # 33 timesteps for history, 1 for future
     prediction_length = 1  # Predict next value
 
     # Ensure data_features is a 2D numpy array or list
@@ -76,45 +76,49 @@ def create_sequences(data_features: Union[List, np.ndarray, pd.DataFrame],
         raise ValueError(f"Length mismatch: data_features has {n_samples} samples, but data_target has {len(data_target)}")
 
     for i in range(n_samples - required_history - prediction_length + 1):
-        # Past features (history) - ensure exactly 13 steps, [seq_length, n_features]
-        sequence = data_features[i:i + seq_length]
+        # Past features (history) - ensure exactly 33 steps to match context_length + max(lags)
+        sequence = data_features[i:i + seq_length - 1]  # 33 timesteps
         logging.debug(f"Sequence {i}: {sequence[:2]}... (length: {len(sequence)}, features: {len(sequence[0]) if sequence and sequence[0] else 0})")
         if not sequence or not isinstance(sequence, list) or not isinstance(sequence[0], (list, tuple)):
             raise ValueError(f"Invalid sequence at index {i}: {sequence}, type: {type(sequence)}")
-        if len(sequence) != seq_length or len(sequence[0]) != input_dim:
-            raise ValueError(f"Sequence {i} shape mismatch: expected [13, {input_dim}], got [len(sequence), {len(sequence[0]) if sequence and sequence[0] else 0}]")
-        X.append(sequence)  # Shape [13, n_features], list of lists
+        if len(sequence) != seq_length - 1 or len(sequence[0]) != input_dim:
+            raise ValueError(f"Sequence {i} shape mismatch: expected [{seq_length - 1}, {input_dim}], got [len(sequence), {len(sequence[0]) if sequence and sequence[0] else 0}]")
+        X.append(sequence)  # Shape [33, n_features], list of lists (full 33 timesteps)
+        # Future features (next value after history) - 1 timestep
+        future_seq = data_features[i + seq_length - 1:i + seq_length]  # 1 timestep
+        if len(future_seq) != 1 or len(future_seq[0]) != input_dim:
+            raise ValueError(f"Future sequence {i} shape mismatch: expected [1, {input_dim}], got [{len(future_seq)}, {len(future_seq[0]) if future_seq and future_seq[0] else 0}]")
         # Target (next value after history, for loss) - ensure 1D [1]
         target_value = data_target[i + required_history]
         logging.debug(f"Target {i}: {target_value} (type: {type(target_value)})")
         if not isinstance(target_value, (int, float)):
             raise ValueError(f"Invalid target value at index {i}: {target_value}, type: {type(target_value)}")
         y.append([target_value])  # Shape [1], wrapped in list for 2D
-        # Past time features (dummy) - ensure exactly 13 steps
-        time_seq = [float(j) / seq_length for j in range(seq_length)]  # Shape [13]
-        time_features.append([[val] for val in time_seq])  # Shape [13, 1], list of lists
-        # Past observed mask - ensure exactly 13 steps
+        # Past time features (dummy) - ensure exactly 33 steps
+        time_seq = [float(j) / 32 for j in range(33)]  # Shape [33], normalized over 33 steps
+        time_features.append([[val] for val in time_seq])  # Shape [33, 1], list of lists
+        # Past observed mask - ensure exactly 33 steps
         if observed_mask is not None:
             if isinstance(observed_mask, (np.ndarray, pd.DataFrame)):
                 observed_mask = observed_mask.tolist()
-            observed_masks.append(observed_mask[i:i + seq_length])  # Shape [13, n_features], list of lists
+            observed_masks.append(observed_mask[i:i + seq_length - 1])  # Full 33 steps
         else:
-            observed_masks.append([[1] * input_dim for _ in range(seq_length)])  # Shape [13, n_features], list of lists
+            observed_masks.append([[1] * input_dim for _ in range(seq_length - 1)])  # Shape [33, n_features]
         # Future values (univariate target, shape [1, 1] for prediction/loss)
-        future_value = [data_target[i + required_history]]  # Shape [1]
+        future_value = [data_target[i + seq_length - 1]]  # Next target value
         future_values.append([[future_value[0]]])  # Shape [1, 1, 1], list of lists (univariate)
         # Future time features (dummy, matching prediction_length and num_time_features) - ensure 3D
-        future_time_seq = [float(required_history) / (required_history + prediction_length)]  # Shape [1]
+        future_time_seq = [float(seq_length - 1) / seq_length]  # Shape [1]
         future_time_features.append([[[val] for val in future_time_seq]])  # Shape [1, 1, 1], list of lists (3D)
 
     # Convert to torch tensors, ensuring correct shapes
     try:
-        X_tensors = [torch.tensor(x, dtype=torch.float32) for x in X]  # List of [13, n_features] tensors
+        X_tensors = [torch.tensor(x, dtype=torch.float32) for x in X]  # List of [33, n_features] tensors
         logging.debug(f"X tensors before stack: {[x.shape for x in X_tensors[:2]]}")
-        X = torch.stack(X_tensors) if X_tensors else torch.tensor([])  # Shape [n_samples, 13, n_features]
+        X = torch.stack(X_tensors) if X_tensors else torch.tensor([])  # Shape [n_samples, 33, n_features]
         y = torch.tensor(y, dtype=torch.float32)  # Shape [n_samples, 1]
-        time_features = torch.tensor(time_features, dtype=torch.float32)  # Shape [n_samples, 13, 1]
-        observed_masks = torch.tensor(observed_masks, dtype=torch.float32) if observed_masks else None  # Shape [n_samples, 13, n_features]
+        time_features = torch.tensor(time_features, dtype=torch.float32)  # Shape [n_samples, 33, 1]
+        observed_masks = torch.tensor(observed_masks, dtype=torch.float32) if observed_masks else None  # Shape [n_samples, 33, n_features]
         future_values = torch.tensor(future_values, dtype=torch.float32)  # Shape [n_samples, 1, 1, 1]
         future_values = future_values.squeeze(-1)  # Shape [n_samples, 1, 1]
         future_time_features = torch.tensor(future_time_features, dtype=torch.float32)  # Shape [n_samples, 1, 1, 1]
@@ -234,10 +238,11 @@ async def main():
         logging.info(f"Preprocessed columns: {preprocessed_df.columns}")
         logging.info(f"Initial data shape: {preprocessed_df.shape}")
 
-        sequence_length = 10
-        required_history = sequence_length + max([1, 2, 3])
-        if len(preprocessed_df) < required_history + 1:
-            raise ValueError(f"Insufficient data for sequence length {required_history + 1}, got {len(preprocessed_df)} rows")
+        sequence_length = 34  # Optimal: context_length (30) + max(lags) (3) + prediction_length (1) = 34
+        prediction_length = 1  # Matches transformer_model.py
+        required_history = sequence_length - 1  # 33 timesteps for history
+        if len(preprocessed_df) < required_history + prediction_length:
+            raise ValueError(f"Insufficient data for sequence length {required_history + prediction_length}, got {len(preprocessed_df)} rows")
 
         # Define features (17 total)
         feature_columns = [
@@ -250,11 +255,11 @@ async def main():
         target_data = preprocessed_df['target'].values
 
         # Ensure observed mask is all 1s (fully observed)
-        observed_mask = np.ones_like(features_data, dtype=np.bool_)
+        observed_mask = np.ones_like(features_data, dtype=np.float32)
 
         # Create sequences
         X, y, past_time_features, past_observed_mask, future_values, future_time_features = create_sequences(
-            features_data.tolist(), target_data.tolist(), seq_length=13
+            features_data.tolist(), target_data.tolist(), seq_length=sequence_length
         )
 
         logging.debug(f"Before split - X shape: {X.shape}, y shape: {y.shape}, past_time_features shape: {past_time_features.shape}, "
