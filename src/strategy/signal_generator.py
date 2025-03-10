@@ -4,12 +4,13 @@ import logging
 import numpy as np
 import pandas as pd
 import torch
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from src.models.transformer_model import TransformerPredictor
-from src.strategy.indicators import calculate_atr, compute_bollinger_bands, compute_vwap, compute_adx, get_onchain_metrics
+from src.strategy.indicators import calculate_atr, compute_bollinger_bands, compute_vwap, compute_adx, get_onchain_metrics, calculate_macd, calculate_rsi
 from src.constants import FEATURE_COLUMNS
 from src.models.train_transformer_model import create_sequences
-from src.strategy.strategy_adapter_new import adapt_strategy_parameters
+from src.strategy.position_sizer import calculate_position_size, kelly_criterion
+from src.strategy.market_regime import detect_market_regime
 
 # Define model input columns (features the model was trained on)
 MODEL_INPUT_COLUMNS = [
@@ -19,9 +20,29 @@ MODEL_INPUT_COLUMNS = [
     'bollinger_lower', 'bollinger_middle'
 ]
 
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s', force=True)
-logging.info("Using UPDATED signal_generator.py - Mar 08, 2025 - VERSION 40")
-print("signal_generator.py loaded - Mar 08, 2025 - VERSION 40")
+# Configure main logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s', force=True)
+logging.info("Using UPDATED signal_generator.py - Mar 09, 2025 - VERSION 82.4 (Leverage Indicators.py)")
+print("signal_generator.py loaded - Mar 09, 2025 - VERSION 82.4 (Leverage Indicators.py)")
+
+# Configure separate loggers with summarized output
+sentiment_logger = logging.getLogger('sentiment')
+sentiment_handler = logging.FileHandler('sentiment.log')
+sentiment_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(message)s'))
+sentiment_logger.addHandler(sentiment_handler)
+sentiment_logger.setLevel(logging.INFO)
+
+indicators_logger = logging.getLogger('indicators')
+indicators_handler = logging.FileHandler('indicators.log')
+indicators_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(message)s'))
+indicators_logger.addHandler(indicators_handler)
+indicators_logger.setLevel(logging.INFO)
+
+signals_logger = logging.getLogger('signals')
+signals_handler = logging.FileHandler('signals.log')
+signals_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(message)s'))
+signals_logger.addHandler(signals_handler)
+signals_logger.setLevel(logging.INFO)
 
 def calculate_historical_sentiment(preprocessed_data: pd.DataFrame, idx) -> float:
     """Estimate historical sentiment based on RSI, MACD, and price trend."""
@@ -30,31 +51,48 @@ def calculate_historical_sentiment(preprocessed_data: pd.DataFrame, idx) -> floa
     if len(historical_data) < 2 or 'momentum_rsi' not in historical_data.columns or 'trend_macd' not in historical_data.columns:
         return 0.0
     
-    # Price trend (normalized change over the window)
     price_change = (historical_data['close'].iloc[-1] - historical_data['close'].iloc[0]) / historical_data['close'].iloc[0] if len(historical_data) > 1 else 0
-    
-    # RSI sentiment (oversold < 30 is bullish, overbought > 70 is bearish)
     rsi = historical_data['momentum_rsi'].iloc[-1]
     rsi_sentiment = -0.5 if rsi > 70 else 0.5 if rsi < 30 else 0.0
-    
-    # MACD sentiment (positive MACD is bullish, negative is bearish)
     macd = historical_data['trend_macd'].iloc[-1]
     macd_sentiment = 0.3 if macd > 0 else -0.3 if macd < 0 else 0.0
-    
-    # Combine sentiment components
     sentiment = np.clip(price_change * 5 + rsi_sentiment + macd_sentiment, -1.0, 1.0)
-    logging.debug(f"Calculated historical sentiment at {idx}: Price Change {price_change:.4f}, RSI {rsi:.2f}, MACD {macd:.2f}, Total {sentiment:.2f}")
-    return sentiment
+    return min(sentiment, 0.3)  # Cap sentiment influence
 
 async def fetch_x_sentiment(preprocessed_data: pd.DataFrame, idx) -> float:
-    """Simulate X sentiment based on recent price trend from historical data."""
+    """
+    Simulate X sentiment based on price trend, RSI, volume change, and Fear & Greed Index.
+    Note: Free X API tier does not support tweet search. Treated as secondary factor per user request.
+    """
+    logging.warning(f"Simulating X sentiment at {idx}. Free X API tier does not support tweet search. Treated as secondary factor.")
     window = 24  # 24-hour window
     historical_data = preprocessed_data.loc[:idx].tail(window) if len(preprocessed_data.loc[:idx]) >= window else preprocessed_data.loc[:idx]
     if len(historical_data) < 2:
         return 0.0
+    
+    # Price change component
     price_change = (historical_data['close'].iloc[-1] - historical_data['close'].iloc[0]) / historical_data['close'].iloc[0]
-    sentiment = np.clip(price_change * 10, -1, 1)  # Scale price change to sentiment range
-    logging.debug(f"Fetched X sentiment at {idx} based on price change {price_change:.4f}: {sentiment:.2f}")
+    price_sentiment = price_change * 5
+
+    # RSI component
+    rsi = historical_data['momentum_rsi'].iloc[-1] if 'momentum_rsi' in historical_data.columns else 50
+    rsi_sentiment = -0.3 if rsi > 70 else 0.3 if rsi < 30 else 0.0
+
+    # Volume change component
+    volume_change = (historical_data['volume'].iloc[-1] - historical_data['volume'].iloc[0]) / historical_data['volume'].iloc[0] if historical_data['volume'].iloc[0] != 0 else 0
+    volume_sentiment = 0.2 if volume_change > 0.1 else -0.2 if volume_change < -0.1 else 0.0
+    if price_change < 0:
+        volume_sentiment *= -1
+
+    # Fear & Greed Index component
+    volatility = historical_data['close'].pct_change().std() * np.sqrt(24)
+    fgi = np.clip(75 - (volatility * 1000), 0, 100)
+    fgi_sentiment = -0.2 if fgi > 70 else 0.2 if fgi < 30 else 0.0
+
+    # Combine components
+    sentiment = price_sentiment + rsi_sentiment + volume_sentiment + fgi_sentiment
+    sentiment = np.clip(sentiment, -1.0, 1.0)
+    logging.info(f"Simulated X sentiment at {idx}: {sentiment:.2f} (Price: {price_sentiment:.2f}, RSI: {rsi_sentiment:.2f}, Volume: {volume_sentiment:.2f}, FGI: {fgi_sentiment:.2f})")
     return sentiment
 
 async def get_fear_and_greed_index(preprocessed_data: pd.DataFrame, idx) -> float:
@@ -64,8 +102,7 @@ async def get_fear_and_greed_index(preprocessed_data: pd.DataFrame, idx) -> floa
     if len(historical_data) < 2:
         return 50.0
     volatility = historical_data['close'].pct_change().std() * np.sqrt(24)
-    fgi = np.clip(75 - (volatility * 1000), 0, 100)  # Scale to 0-100, higher volatility lowers FGI
-    logging.debug(f"Fetched FGI at {idx} based on volatility {volatility:.4f}: {fgi:.2f}")
+    fgi = np.clip(75 - (volatility * 1000), 0, 100)
     return fgi
 
 def simulate_historical_whale_moves(preprocessed_data: pd.DataFrame, idx) -> float:
@@ -75,20 +112,49 @@ def simulate_historical_whale_moves(preprocessed_data: pd.DataFrame, idx) -> flo
     if len(historical_data) < 2:
         return 0.0
     volatility = historical_data['close'].pct_change().std() * np.sqrt(24)
-    # Higher volatility suggests more whale activity (e.g., sell-offs or accumulation)
-    whale_moves = np.clip(volatility * 50, 0, 1)  # Scale to 0-1
-    logging.debug(f"Simulated whale moves at {idx} based on volatility {volatility:.4f}: {whale_moves:.2f}")
+    whale_moves = np.clip(volatility * 50, 0, 1)
     return whale_moves
+
+def adapt_strategy_parameters(scaled_df: pd.DataFrame) -> dict:
+    """Adapt strategy parameters based on market conditions."""
+    market_regime = detect_market_regime(scaled_df)
+    regime_params = {
+        'Bullish Low Volatility': {'rsi_threshold': 45, 'macd_fast': 10, 'macd_slow': 20, 'atr_multiplier': 3.0, 'max_risk_pct': 0.15},
+        'Bullish High Volatility': {'rsi_threshold': 50, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 3.0, 'max_risk_pct': 0.15},
+        'Bearish Low Volatility': {'rsi_threshold': 40, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 3.0, 'max_risk_pct': 0.15},
+        'Bearish High Volatility': {'rsi_threshold': 35, 'macd_fast': 15, 'macd_slow': 30, 'atr_multiplier': 3.0, 'max_risk_pct': 0.15},
+        'Neutral': {'rsi_threshold': 45, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 3.0, 'max_risk_pct': 0.15},
+    }
+    return regime_params.get(market_regime, {'rsi_threshold': 45, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 3.0, 'max_risk_pct': 0.15})
+
+def filter_signals(signal_df: pd.DataFrame) -> pd.DataFrame:
+    """Filter signals to enforce a minimum hold period, dynamically adjusted by price volatility."""
+    filtered_df = signal_df.copy()
+    last_trade_time = None
+    min_hold_period = 4  # Increased to 4 hours to reduce overtrading
+    for idx in filtered_df.index:
+        current_signal = filtered_df.loc[idx, 'signal']
+        price_volatility = filtered_df.loc[idx, 'price_volatility'] if 'price_volatility' in filtered_df.columns else 0.0
+        dynamic_min_hold = min_hold_period if price_volatility <= filtered_df['price_volatility'].mean() else 2  # Relax in high volatility
+        if (last_trade_time is None or 
+            (idx - last_trade_time).total_seconds() / 3600 >= dynamic_min_hold) and current_signal != 0 and filtered_df.loc[idx, 'signal_confidence'] >= 0.05:
+            last_trade_time = idx
+            signals_logger.info(f"Accepted signal at {idx} with confidence {filtered_df.loc[idx, 'signal_confidence']:.2f}")
+        else:
+            filtered_df.loc[idx, 'signal'] = 0
+            if current_signal != 0:
+                signals_logger.debug(f"Signal filtered at {idx} due to min hold period ({dynamic_min_hold} hours) or low confidence ({filtered_df.loc[idx, 'signal_confidence']:.2f})")
+    return filtered_df
 
 async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFrame, model: TransformerPredictor, 
                           train_columns: List[str], feature_scaler, target_scaler, rsi_threshold: float = 50, 
-                          macd_fast: int = 12, macd_slow: int = 26, atr_multiplier: float = 4.0,  # Increased to 4.0
-                          max_risk_pct: float = 0.15) -> pd.DataFrame:
+                          macd_fast: int = 12, macd_slow: int = 26, atr_multiplier: float = 2.0, 
+                          max_risk_pct: float = 0.20) -> pd.DataFrame:
     """Enhanced signal generator using model predictions, technical indicators, and historical sentiment data."""
     print("Entering generate_signals function")
     logging.debug("Function entry - generate_signals called with preprocessed_data")
 
-    required_columns = ['close', 'sma_20', 'adx', 'vwap', 'atr', 'target', 'price_volatility', 'high', 'low', 'volume', 'momentum_rsi', 'trend_macd']
+    required_columns = ['close', 'sma_20', 'adx', 'vwap', 'atr', 'target', 'price_volatility', 'high', 'low', 'volume', 'momentum_rsi', 'trend_macd', 'returns']
     print(f"Required columns: {required_columns}")
     logging.debug(f"Checking required columns: {required_columns}")
     for col in required_columns:
@@ -116,13 +182,13 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
         rsi_threshold = params['rsi_threshold']
         macd_fast = params['macd_fast']
         macd_slow = params['macd_slow']
-        atr_multiplier = params['atr_multiplier']
-        max_risk_pct = 0.15  # Reduced to 15% risk per trade
+        atr_multiplier = params['atr_multiplier']  # Use adapted value, default to 3.0
+        max_risk_pct = params['max_risk_pct']  # Use adapted max_risk_pct
         print(f"Adapted params: {params}")
         logging.debug(f"Step 3: Adapted params: {params}")
 
         print("Extracting features for model prediction")
-        features = scaled_df[MODEL_INPUT_COLUMNS].values  # Use only model-trained features
+        features = scaled_df[MODEL_INPUT_COLUMNS].values
         print(f"Features shape: {features.shape}")
         logging.debug(f"Step 4: Features shape: {features.shape}")
         if len(features.shape) == 1:
@@ -207,58 +273,73 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
         predictions_unscaled = target_scaler.inverse_transform(predictions).flatten()
         print(f"Predictions unscaled shape: {predictions_unscaled.shape}")
         print(f"Predictions unscaled sample: {predictions_unscaled[:5]}")
-        if any(p <= 0 or p < 10000 or p > 200000 for p in predictions_unscaled):
+        if any(p <= 0 or p < 10000 or p > 200200 for p in predictions_unscaled):
             logging.warning(f"Potential scaling error in predictions_unscaled: {predictions_unscaled[:5]}")
         signal_df = scaled_df.copy()
         signal_df['predicted_price'] = pd.Series(predictions_unscaled, index=scaled_df.index)
+        signal_df['raw_predicted_price'] = signal_df['predicted_price'].copy()  # Log raw predictions
 
-        # Correct model prediction bias
-        prediction_errors = []
-        for idx in signal_df.index:
-            if idx != signal_df.index[0]:  # Skip first row to avoid NaN in diff
-                actual_price = preprocessed_data['close'].loc[idx]
-                predicted_price = signal_df['predicted_price'].loc[idx]
-                error = predicted_price - actual_price
-                prediction_errors.append(error)
-        avg_error = np.mean(prediction_errors) if prediction_errors else 0
-        logging.info(f"Average prediction error: {avg_error:.2f} USD")
-        signal_df['predicted_price'] = signal_df['predicted_price'] - avg_error  # Adjust predictions
-
-        # Preserve datetime index and ensure no scaling errors
-        signal_df.index = preprocessed_data.index
-
-        print("Calculating indicators with unscaled values, ensuring no scaling errors")
-        # Use unscaled 'close', 'high', 'low', and 'volume' from preprocessed_data
+        # Define unscaled variables before correction
         unscaled_close = preprocessed_data['close'].copy()
         unscaled_high = preprocessed_data['high'].copy()
         unscaled_low = preprocessed_data['low'].copy()
         unscaled_volume = preprocessed_data['volume'].copy()
 
-        # Validate and correct unscaled prices and volume
         if unscaled_close.isna().any() or unscaled_high.isna().any() or unscaled_low.isna().any() or unscaled_volume.isna().any():
             logging.warning("Unscaled prices or volume contain NaN values. Filling with previous valid values or defaults.")
             unscaled_close = unscaled_close.fillna(method='ffill').fillna(78877.88)
             unscaled_high = unscaled_high.fillna(method='ffill').fillna(79367.5)
             unscaled_low = unscaled_low.fillna(method='ffill').fillna(78186.98)
             unscaled_volume = unscaled_volume.fillna(method='ffill').fillna(1000.0)
-        if (unscaled_close <= 0).any() or (unscaled_close < 10000).any() or (unscaled_close > 200000).any():
+        if (unscaled_close <= 0).any() or (unscaled_close < 10000).any() or (unscaled_close > 200200).any():
             logging.warning("Unscaled prices appear scaled or invalid. Correcting to default BTC price range.")
-            unscaled_close = unscaled_close.apply(lambda x: 78877.88 if x <= 0 or x < 10000 or x > 200000 else x)
-            unscaled_high = unscaled_high.apply(lambda x: 79367.5 if x <= 0 or x < 10000 or x > 200000 else x)
-            unscaled_low = unscaled_low.apply(lambda x: 78186.98 if x <= 0 or x < 10000 or x > 200000 else x)
+            unscaled_close = unscaled_close.apply(lambda x: 78877.88 if x <= 0 or x < 10000 or x > 200200 else x)
+            unscaled_high = unscaled_high.apply(lambda x: 79367.5 if x <= 0 or x < 10000 or x > 200200 else x)
+            unscaled_low = unscaled_low.apply(lambda x: 78186.98 if x <= 0 or x < 10000 or x > 200200 else x)
 
-        # Recalculate indicators if needed (should already be in preprocessed_data)
-        signal_df['rsi'] = preprocessed_data['momentum_rsi'].copy()  # Use precomputed RSI
-        signal_df['macd'], signal_df['macd_signal'] = preprocessed_data['trend_macd'].copy(), pd.Series(np.zeros(len(signal_df)), index=signal_df.index)  # Use precomputed MACD
+        # Correct model prediction bias using a rolling 24h window with .loc
+        avg_error = 0
+        window = 24
+        for i in range(len(signal_df)):
+            idx = signal_df.index[i]
+            if i < window:
+                errors = [p - unscaled_close.loc[idx] for idx, p in zip(signal_df.index[:i+1], signal_df['raw_predicted_price'][:i+1]) if idx != signal_df.index[0]]
+            else:
+                errors = [p - unscaled_close.loc[idx] for idx, p in zip(signal_df.index[i-window+1:i+1], signal_df['raw_predicted_price'][i-window+1:i+1])]
+            avg_error = np.mean(errors) if errors else avg_error
+            signal_df.loc[idx, 'predicted_price'] = signal_df.loc[idx, 'raw_predicted_price'] - avg_error
+        logging.info(f"Final average prediction error after rolling correction: {avg_error:.2f} USD")
+
+        # Calculate indicators with unscaled values using indicators.py
+        signal_df['rsi'] = calculate_rsi(unscaled_close)  # Replace precomputed RSI
+        if signal_df['rsi'].isna().all():
+            signal_df['rsi'] = 50.0  # Fallback
+            logging.warning("RSI column is all NaN, using fallback value 50.0")
+        macd, macd_signal = calculate_macd(unscaled_close, fast=macd_fast, slow=macd_slow)  # Replace compute_macd
+        if macd.isna().all():
+            macd = pd.Series(np.zeros(len(signal_df)), index=signal_df.index)
+            macd_signal = pd.Series(np.zeros(len(signal_df)), index=signal_df.index)
+            logging.warning("MACD column is all NaN, using fallback value 0.0")
+        signal_df['macd'] = macd
+        signal_df['macd_signal'] = macd_signal
         signal_df['atr'] = calculate_atr(unscaled_high, unscaled_low, unscaled_close).fillna(500.0)
         signal_df['vwap'] = compute_vwap(preprocessed_data)
-        signal_df['adx'] = compute_adx(preprocessed_data)
+        signal_df['adx'] = compute_adx(preprocessed_data).fillna(10.0)
+        if signal_df['adx'].isna().all():
+            signal_df['adx'] = 10.0
+            logging.warning("ADX column is all NaN, using fallback value 10.0")
+        signal_df['sma_10'] = unscaled_close.rolling(window=10, min_periods=1).mean().bfill()
+        signal_df['sma_20'] = unscaled_close.rolling(window=20, min_periods=1).mean().bfill()
+        signal_df['volume_sma_20'] = unscaled_volume.rolling(window=20, min_periods=1).mean().bfill()
 
-        # Add SMA_10 and SMA_20 for trend filtering
-        signal_df['sma_10'] = unscaled_close.rolling(window=10).mean().bfill()
-        signal_df['sma_20'] = unscaled_close.rolling(window=20).mean().bfill()
+        # Log indicator samples for debugging
+        logging.debug(f"Sample RSI: {signal_df['rsi'].head().to_list()}")
+        logging.debug(f"Sample MACD: {signal_df['macd'].head().to_list()}")
+        logging.debug(f"Sample MACD Signal: {signal_df['macd_signal'].head().to_list()}")
+        logging.debug(f"Sample ADX: {signal_df['adx'].head().to_list()}")
+        logging.debug(f"Sample SMA_10: {signal_df['sma_10'].head().to_list()}")
+        logging.debug(f"Sample SMA_20: {signal_df['sma_20'].head().to_list()}")
 
-        # Calculate Bollinger Bands
         bollinger_bands = compute_bollinger_bands(preprocessed_data)
         if isinstance(bollinger_bands, pd.DataFrame) and 'bb_breakout' in bollinger_bands.columns:
             signal_df['bb_breakout'] = bollinger_bands['bb_breakout']
@@ -266,18 +347,61 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
             logging.warning("Bollinger Bands output missing 'bb_breakout'. Using default value of 0.")
             signal_df['bb_breakout'] = 0
 
-        # Fetch historical sentiment data
         signal_df['sentiment_score'] = [calculate_historical_sentiment(preprocessed_data, idx) for idx in signal_df.index]
         signal_df['x_sentiment'] = [await fetch_x_sentiment(preprocessed_data, idx) for idx in signal_df.index]
         signal_df['fear_greed_index'] = [await get_fear_and_greed_index(preprocessed_data, idx) for idx in signal_df.index]
         signal_df['whale_moves'] = [simulate_historical_whale_moves(preprocessed_data, idx) for idx in signal_df.index]
-
-        # Add on-chain hash rate (static for now)
         signal_df['hash_rate'] = get_onchain_metrics(symbol="BTC")['hash_rate']
 
-        # Signal generation with SMA crossover, ADX filter, and sentiment
+        # Detect market regime
+        signal_df['market_regime'] = [detect_market_regime(signal_df.loc[:idx], window=12) for idx in signal_df.index]
+
+        summary_interval = 24
+        for i in range(0, len(signal_df), summary_interval):
+            end_idx = min(i + summary_interval, len(signal_df))
+            window_df = signal_df.iloc[i:end_idx]
+            if not window_df.empty:
+                rsi_mean = window_df['rsi'].mean()
+                rsi_overbought = (window_df['rsi'] > 70).sum()
+                rsi_oversold = (window_df['rsi'] < 30).sum()
+                macd_mean = window_df['macd'].mean()
+                adx_mean = window_df['adx'].mean()
+                adx_strong = (window_df['adx'] > 10).sum()
+                bb_breakouts = window_df['bb_breakout'].value_counts().to_dict()
+                sma_trend_bullish = (window_df['sma_10'] > window_df['sma_20']).sum()
+                indicators_logger.info(
+                    f"Indicator Summary [{window_df.index[0]} to {window_df.index[-1]}]: "
+                    f"RSI Mean: {rsi_mean:.2f}, Overbought (>70): {rsi_overbought}, Oversold (<30): {rsi_oversold}, "
+                    f"MACD Mean: {macd_mean:.2f}, ADX Mean: {adx_mean:.2f}, Strong Trend (>10): {adx_strong}, "
+                    f"BB Breakouts: {bb_breakouts}, SMA Bullish (10>20): {sma_trend_bullish}/{len(window_df)}"
+                )
+
+        sentiment_summary = {
+            'sentiment_score_mean': signal_df['sentiment_score'].mean(),
+            'x_sentiment_mean': signal_df['x_sentiment'].mean(),
+            'fear_greed_mean': signal_df['fear_greed_index'].mean(),
+            'whale_moves_mean': signal_df['whale_moves'].mean(),
+            'sentiment_score_positive': (signal_df['sentiment_score'] > 0).sum(),
+            'x_sentiment_positive': (signal_df['x_sentiment'] > 0).sum(),
+            'fear_greed_extreme_fear': (signal_df['fear_greed_index'] < 30).sum(),
+            'fear_greed_extreme_greed': (signal_df['fear_greed_index'] > 70).sum(),
+            'whale_moves_active': (signal_df['whale_moves'] > 0.2).sum()
+        }
+        sentiment_logger.info(
+            f"Sentiment Summary: Sentiment Score Mean: {sentiment_summary['sentiment_score_mean']:.2f}, "
+            f"X Sentiment Mean: {sentiment_summary['x_sentiment_mean']:.2f}, "
+            f"Fear & Greed Mean: {sentiment_summary['fear_greed_mean']:.2f}, "
+            f"Whale Moves Mean: {sentiment_summary['whale_moves_mean']:.2f}, "
+            f"Positive Sentiment Score: {sentiment_summary['sentiment_score_positive']}, "
+            f"Positive X Sentiment: {sentiment_summary['x_sentiment_positive']}, "
+            f"Extreme Fear (<30): {sentiment_summary['fear_greed_extreme_fear']}, "
+            f"Extreme Greed (>70): {sentiment_summary['fear_greed_extreme_greed']}, "
+            f"Active Whale Moves (>0.2): {sentiment_summary['whale_moves_active']}"
+        )
+
         signal_df['signal'] = 0
         signal_df['signal_confidence'] = 0.0
+        mean_volatility = signal_df['price_volatility'].mean()  # Compute mean volatility for filtering
         for idx in signal_df.index:
             unscaled_close_val = unscaled_close.loc[idx]
             unscaled_atr_val = signal_df['atr'].loc[idx]
@@ -291,126 +415,234 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
             whale_moves = signal_df['whale_moves'].loc[idx]
             x_sentiment = signal_df['x_sentiment'].loc[idx]
             fgi = signal_df['fear_greed_index'].loc[idx]
-            
-            logging.debug(f"Idx: {idx}, Sentiment: {sentiment:.2f}, X Sentiment: {x_sentiment:.2f}, Whale Moves: {whale_moves:.2f}, FGI: {fgi:.2f}")
+            predicted_price = signal_df['predicted_price'].loc[idx]
+            raw_predicted_price = signal_df['raw_predicted_price'].loc[idx]
+            volume = unscaled_volume.loc[idx]
+            volume_sma_20 = signal_df['volume_sma_20'].loc[idx]
+            market_regime = signal_df['market_regime'].loc[idx]
+            macd_signal = signal_df['macd_signal'].loc[idx]
+            price_volatility = signal_df['price_volatility'].loc[idx]
             
             if pd.isna(unscaled_atr_val):
                 unscaled_atr_val = 500.0
-            if unscaled_close_val <= 0 or unscaled_close_val < 10000 or unscaled_close_val > 200000:
+            if unscaled_close_val <= 0 or unscaled_close_val < 10000 or unscaled_close_val > 200200:
                 logging.warning(f"Invalid unscaled close at {idx}: {unscaled_close_val}, using 78877.88 USD")
                 unscaled_close_val = 78877.88
 
-            # Trend direction using SMA_10/SMA_20 crossover and ADX filter
-            trend = 'bullish' if sma_10 > sma_20 and adx > 20 else 'bearish' if sma_10 < sma_20 and adx > 20 else 'neutral'
-            
-            # Calculate confidence score with adjusted threshold
+            # Log indicator values for debugging
+            signals_logger.debug(f"Indicator values at {idx}: ADX={adx:.2f}, SMA_10={sma_10:.2f}, SMA_20={sma_20:.2f}, RSI={unscaled_rsi:.2f}, MACD={unscaled_macd:.6f}, MACD_Signal={macd_signal:.6f}, Predicted={predicted_price:.2f}, Raw_Predicted={raw_predicted_price:.2f}, Market Regime={market_regime}")
+
+            trend = 'bullish' if sma_10 > sma_20 and adx > 10 else 'bearish' if sma_10 < sma_20 and adx > 10 else 'neutral'
             confidence = 0.0
-            price_change_threshold = unscaled_atr_val * 0.1  # Increased to 0.1
-            predicted_price = signal_df['predicted_price'].loc[idx]
-            if predicted_price > unscaled_close_val + price_change_threshold and sma_10 > sma_20 * 1.01:  # Added SMA confirmation
+            price_change_threshold = unscaled_atr_val * 0.02
+            sma_condition_buy = sma_10 > sma_20 * 1.0003
+            sma_condition_sell = sma_10 < sma_20 * 0.9997
+        
+            # Skip signals during high volatility periods
+            if price_volatility > 2 * mean_volatility:
+                signals_logger.debug(f"Skipping signal at {idx} due to high volatility: {price_volatility:.4f} > {2 * mean_volatility:.4f}")
+                continue
+
+            # Buy conditions based on market regime with momentum boost and FGI confirmation
+            if trend == 'bullish' and predicted_price > unscaled_close_val + 0.5 * price_change_threshold and sma_condition_buy and unscaled_rsi < rsi_threshold - 5 and unscaled_macd > -0.002 and volume > 0.9 * volume_sma_20 and adx > 8 and fgi < 80:
                 confidence += 0.4
-                if unscaled_rsi < 40:
+                if unscaled_rsi < rsi_threshold - 20:
                     confidence += 0.2
-                if unscaled_macd > 0.005 and signal_df['macd_signal'].loc[idx] < unscaled_macd:
-                    confidence += 0.2
+                if unscaled_macd > 0.0005 and unscaled_macd > macd_signal:  # Relaxed momentum boost
+                    confidence += 0.3
                 if bb_breakout == 1:
                     confidence += 0.1
                 if sentiment > 0 and whale_moves > 0.2:
-                    confidence += 0.2  # Increased to 0.2
+                    confidence += 0.2
                 if x_sentiment > 0 and whale_moves > 0.2:
                     confidence += 0.2
                 if fgi < 30:
                     confidence += 0.2
                 elif fgi > 70:
                     confidence -= 0.2
-                if confidence >= 0.4:
+
+                # Allow trades in Bullish or Neutral regimes
+                if 'Bullish' in market_regime and confidence >= 0.05:
                     signal_df.loc[idx, 'signal'] = 1
-            elif predicted_price < unscaled_close_val - price_change_threshold and sma_10 < sma_20 * 0.99:  # Added SMA confirmation
+                elif 'Neutral' in market_regime and confidence >= 0.4:  # Further lowered threshold
+                    signal_df.loc[idx, 'signal'] = 1
+            
+            # Sell conditions with enhanced bearish triggers, FGI confirmation, and forced fallback
+            sell_condition_trend = (trend == 'bearish' or unscaled_rsi > rsi_threshold or unscaled_macd < 0)
+            sell_condition_price = (predicted_price < unscaled_close_val - 0.005 * price_change_threshold)
+            sell_condition_sma_rsi_macd = (sma_condition_sell or unscaled_rsi > rsi_threshold or unscaled_macd < 0)
+            sell_condition_volume_adx = (volume > volume_sma_20 and adx > 10)
+            signals_logger.debug(
+                f"Sell Conditions at {idx}: "
+                f"Trend/Bearish={sell_condition_trend} (Trend={trend}, RSI={unscaled_rsi:.2f}, MACD={unscaled_macd:.6f}), "
+                f"Price={sell_condition_price} (Predicted={predicted_price:.2f}, Close={unscaled_close_val:.2f}, Threshold={0.005 * price_change_threshold:.2f}), "
+                f"SMA/RSI/MACD={sell_condition_sma_rsi_macd} (SMA_10={sma_10:.2f}, SMA_20={sma_20:.2f}), "
+                f"Volume/ADX={sell_condition_volume_adx} (Volume={volume:.2f}, Volume_SMA_20={volume_sma_20:.2f}, ADX={adx:.2f})"
+            )
+
+            if sell_condition_trend and sell_condition_price and sell_condition_sma_rsi_macd and sell_condition_volume_adx:
                 confidence += 0.4
-                if unscaled_rsi > 60:
+                if unscaled_rsi > rsi_threshold + 10:
                     confidence += 0.2
-                if unscaled_macd < -0.005 and signal_df['macd_signal'].loc[idx] > unscaled_macd:
-                    confidence += 0.2
+                    signals_logger.debug(f"Sell Confidence Boost: RSI > {rsi_threshold + 10} (RSI={unscaled_rsi:.2f})")
+                if unscaled_macd < -0.001 and unscaled_macd < macd_signal:  # Relaxed momentum boost
+                    confidence += 0.3
+                    signals_logger.debug(f"Sell Confidence Boost: MACD < -0.001 (MACD={unscaled_macd:.6f}, MACD_Signal={macd_signal:.6f})")
                 if bb_breakout == -1:
                     confidence += 0.1
+                    signals_logger.debug(f"Sell Confidence Boost: BB Breakout = -1")
                 if sentiment < 0 and whale_moves > 0.2:
                     confidence += 0.2
+                    signals_logger.debug(f"Sell Confidence Boost: Negative Sentiment and Whale Moves")
                 if x_sentiment < 0 and whale_moves > 0.2:
                     confidence += 0.2
-                if fgi < 30:
-                    confidence -= 0.2
-                elif fgi > 70:
+                    signals_logger.debug(f"Sell Confidence Boost: Negative X Sentiment and Whale Moves")
+                if fgi > 25:
                     confidence += 0.2
-                if confidence >= 0.4:
+                    signals_logger.debug(f"Sell Confidence Boost: FGI > 25 (FGI={fgi:.2f})")
+                elif fgi < 25:
+                    confidence -= 0.2
+                    signals_logger.debug(f"Sell Confidence Penalty: FGI < 25 (FGI={fgi:.2f})")
+
+                # Allow sells in Bearish or Neutral regimes, or force if RSI/MACD strongly bearish for 5 periods
+                if ('Bearish' in market_regime or unscaled_rsi > rsi_threshold + 20 or unscaled_macd < -0.005) and confidence >= 0.05:
                     signal_df.loc[idx, 'signal'] = -1
+                    signals_logger.info(f"Sell Signal Generated: Bearish Regime or Strong Bearish Indicators, Confidence={confidence:.2f}")
+                elif 'Neutral' in market_regime and confidence >= 0.5:
+                    signal_df.loc[idx, 'signal'] = -1
+                    signals_logger.info(f"Sell Signal Generated: Neutral Regime, Confidence={confidence:.2f}")
+                elif (unscaled_rsi > rsi_threshold + 20 or unscaled_macd < -0.005):
+                    window_df = signal_df.loc[signal_df.index <= idx].tail(5)
+                    if (window_df['rsi'].max() > rsi_threshold + 20 or window_df['macd'].min() < -0.005) and confidence >= 0.05:
+                        signal_df.loc[idx, 'signal'] = -1
+                        signals_logger.info(f"Sell Signal Generated: Forced Sell due to Strong Bearish RSI/MACD, Confidence={confidence:.2f}")
             
             signal_df.loc[idx, 'signal_confidence'] = min(1.0, max(0.0, confidence))
-            if signal_df.loc[idx, 'signal_confidence'] < 0.001:
+            if signal_df.loc[idx, 'signal_confidence'] < 0.05:
                 logging.warning(f"Low signal_confidence at {idx}: {signal_df.loc[idx, 'signal_confidence']}")
 
-        # Apply indicator-based filtering
-        for idx in signal_df.index:
-            unscaled_rsi = signal_df['rsi'].loc[idx]
-            unscaled_macd = signal_df['macd'].loc[idx]
-            price_volatility = signal_df['price_volatility'].loc[idx]
-            
-            if price_volatility > signal_df['price_volatility'].mean():
-                rsi_buy_threshold = 40
-                rsi_sell_threshold = 60
-            else:
-                rsi_buy_threshold = 40
-                rsi_sell_threshold = 60
-            
-            if pd.isna(unscaled_rsi) or pd.isna(unscaled_macd):
-                logging.warning(f"NaN detected in indicators at {idx}. Skipping filtering.")
-                continue
-            if unscaled_rsi > rsi_sell_threshold:
-                signal_df.loc[idx, 'signal'] = 0 if signal_df.loc[idx, 'signal'] == 1 else signal_df.loc[idx, 'signal']
-            elif unscaled_rsi < rsi_buy_threshold:
-                signal_df.loc[idx, 'signal'] = 0 if signal_df.loc[idx, 'signal'] == -1 else signal_df.loc[idx, 'signal']
-            elif unscaled_macd < -0.005 and signal_df.loc[idx, 'signal'] != 1:
-                signal_df.loc[idx, 'signal'] = -1
-
-        # Count signals
         initial_buy_count = (signal_df['signal'] == 1).sum()
         initial_sell_count = (signal_df['signal'] == -1).sum()
-        logging.info(f"Initial signals: Buy signals: {initial_buy_count}, Sell signals: {initial_sell_count}")
+        low_confidence_count = (signal_df['signal_confidence'] < 0.1).sum()
+        signals_logger.info(
+            f"Initial Signal Summary: Buy Signals: {initial_buy_count}, Sell Signals: {initial_sell_count}, "
+            f"Confidence Mean: {signal_df['signal_confidence'].mean():.2f}, "
+            f"Confidence Std: {signal_df['signal_confidence'].std():.2f}, "
+            f"Low Confidence (<0.1): {low_confidence_count}"
+        )
+
+        for i in range(0, len(signal_df), summary_interval):
+            end_idx = min(i + summary_interval, len(signal_df))
+            window_df = signal_df.iloc[i:end_idx]
+            if not window_df.empty:
+                window_buy_count = (window_df['signal'] == 1).sum()
+                window_sell_count = (window_df['signal'] == -1).sum()
+                window_confidence_mean = window_df['signal_confidence'].mean()
+                signals_logger.info(
+                    f"Signal Summary [{window_df.index[0]} to {window_df.index[-1]}]: "
+                    f"Buy Signals: {window_buy_count}, Sell Signals: {window_sell_count}, "
+                    f"Confidence Mean: {window_confidence_mean:.2f}"
+                )
 
         signal_df = filter_signals(signal_df)
         final_buy_count = (signal_df['signal'] == 1).sum()
         final_sell_count = (signal_df['signal'] == -1).sum()
-        logging.info(f"After filtering: Buy signals: {final_buy_count}, Sell signals: {final_sell_count}")
+        signals_logger.info(
+            f"Final Signal Summary After Filtering: Buy Signals: {final_buy_count}, Sell Signals: {final_sell_count}, "
+            f"Filtered Out: {(initial_buy_count + initial_sell_count) - (final_buy_count + final_sell_count)}"
+        )
 
-        # Position sizing with dynamic take-profit
         capital = 10000
-        for idx in signal_df.index:
+
+        # Precompute take_profit and stop_loss for signal rows to enable dynamic metrics calculation
+        signal_df['take_profit'] = np.nan
+        signal_df['stop_loss'] = np.nan
+        signal_df['trade_outcome'] = np.nan  # Placeholder for backtest integration
+        signal_indices = signal_df[signal_df['signal'] != 0].index  # Include both buy and sell signals
+        for idx in signal_indices:
             unscaled_close_val = unscaled_close.loc[idx]
             unscaled_atr_val = signal_df['atr'].loc[idx]
             price_volatility = signal_df['price_volatility'].loc[idx]
             
             if pd.isna(unscaled_atr_val):
                 unscaled_atr_val = 500.0
-            if unscaled_close_val <= 0 or unscaled_close_val < 10000 or unscaled_close_val > 200000:
+            if unscaled_close_val <= 0 or unscaled_close_val < 10000 or unscaled_close_val > 200200:
                 logging.warning(f"Invalid unscaled close at {idx}: {unscaled_close_val}, using 78877.88 USD")
                 unscaled_close_val = 78877.88
             
-            risk_factor = 0.05
-            volatility_adjustment = max(0.8, min(1.2, price_volatility / (signal_df['price_volatility'].mean() * 1.2)))
-            position_size = (capital * risk_factor) / (unscaled_atr_val * volatility_adjustment) / (unscaled_close_val / 100000)
-            atr_risk = unscaled_atr_val * atr_multiplier
-            position_size = min(position_size, max_risk_pct * capital / (unscaled_close_val + atr_risk * volatility_adjustment))
-            if pd.isna(position_size) or position_size <= 0:
-                logging.error(f"Invalid position_size at {idx}: {position_size:.6f} BTC, using 0.05 BTC")
-                position_size = 0.05
+            if signal_df.loc[idx, 'signal'] == 1:  # Buy signal
+                signal_df.loc[idx, 'take_profit'] = unscaled_close_val + (unscaled_atr_val * 6.0)
+                signal_df.loc[idx, 'stop_loss'] = unscaled_close_val - (unscaled_atr_val * 2.5)
+            elif signal_df.loc[idx, 'signal'] == -1:  # Sell signal
+                signal_df.loc[idx, 'take_profit'] = unscaled_close_val - (unscaled_atr_val * 6.0)
+                signal_df.loc[idx, 'stop_loss'] = unscaled_close_val + (unscaled_atr_val * 2.5)
+            signals_logger.debug(f"Precomputed trade levels at {idx}: Take_Profit={signal_df.loc[idx, 'take_profit']:.2f}, Stop_Loss={signal_df.loc[idx, 'stop_loss']:.2f}")
+
+        # Dynamically calculate win rate and risk-reward ratio after trade levels are assigned
+        historical_trades = signal_df[signal_df['signal'] != 0].tail(20)
+        if len(historical_trades) > 0 and 'take_profit' in historical_trades.columns and 'stop_loss' in historical_trades.columns:
+            trade_outcomes = historical_trades['trade_outcome'].dropna()
+            if len(trade_outcomes) > 0:
+                wins = sum(1 for outcome in trade_outcomes if outcome == 1)
+                total_trades = len(trade_outcomes)
+                win_rate = wins / total_trades if total_trades > 0 else 0.33
+            else:
+                win_rate = 0.33
+            avg_win = (historical_trades['take_profit'].mean() - historical_trades['close'].mean()) if win_rate > 0 else 279.56
+            avg_loss = (historical_trades['close'].mean() - historical_trades['stop_loss'].mean()) if win_rate < 1.0 else 117.15
+            risk_reward_ratio = avg_win / avg_loss if avg_loss > 0 else 2.0
+        else:
+            win_rate = 0.33
+            risk_reward_ratio = 2.0
+        logging.info(f"Dynamic Metrics: Win Rate={win_rate:.2f}, Risk/Reward Ratio={risk_reward_ratio:.2f}")
+
+        # Now assign position sizes and ensure take_profit/stop_loss for all rows
+        signal_df['position_size'] = 0.0
+        for idx in signal_df.index:
+            unscaled_close_val = unscaled_close.loc[idx]
+            unscaled_atr_val = signal_df['atr'].loc[idx]
+            
+            if pd.isna(unscaled_atr_val):
+                unscaled_atr_val = 500.0
+            if unscaled_close_val <= 0 or unscaled_close_val < 10000 or unscaled_close_val > 200200:
+                logging.warning(f"Invalid unscaled close at {idx}: {unscaled_close_val}, using 78877.88 USD")
+                unscaled_close_val = 78877.88
+            
+            # Use Kelly Criterion for position sizing when a signal is present
+            if signal_df.loc[idx, 'signal'] != 0:
+                position_size = kelly_criterion(win_rate, risk_reward_ratio, capital, unscaled_atr_val, unscaled_close_val, max_risk_pct=max_risk_pct)
+                # Enforce minimum position size
+                position_size = max(position_size, 0.01)
+                # Cap position size at 0.005 BTC to avoid excessive overrides
+                position_size = min(position_size, 0.005)
+                signals_logger.info(f"Trade Entry ({'Buy' if signal_df.loc[idx, 'signal'] == 1 else 'Sell'}) at {idx}: {position_size:.6f} BTC, Price: {unscaled_close_val:.2f} USD")
+            else:
+                position_size = calculate_position_size(capital, unscaled_atr_val, unscaled_close_val, max_risk_pct=max_risk_pct)
+                position_size = max(position_size, 0.01)
+                position_size = min(position_size, 0.005)
+            
             signal_df.loc[idx, 'position_size'] = position_size
-            signal_df.loc[idx, 'take_profit'] = unscaled_close_val + (unscaled_atr_val * 4.0)  # Dynamic take-profit
-            signal_df.loc[idx, 'stop_loss'] = unscaled_close_val - (unscaled_atr_val * atr_multiplier)  # Wider stop-loss
-            logging.debug(f"Position size at {idx}: {position_size:.6f} BTC, Unscaled Close: {unscaled_close_val:.2f} USD, ATR: {unscaled_atr_val:.2f}, Volatility Adjustment: {volatility_adjustment:.2f}")
+
+            # Assign take_profit and stop_loss for all rows (already done for signal rows)
+            if pd.isna(signal_df.loc[idx, 'take_profit']):
+                signal_df.loc[idx, 'take_profit'] = unscaled_close_val + (unscaled_atr_val * 6.0)
+            if pd.isna(signal_df.loc[idx, 'stop_loss']):
+                signal_df.loc[idx, 'stop_loss'] = unscaled_close_val - (unscaled_atr_val * 2.5)
+            
+            signals_logger.debug(f"Trade levels at {idx}: Take_Profit={signal_df.loc[idx, 'take_profit']:.2f}, Stop_Loss={signal_df.loc[idx, 'stop_loss']:.2f}, Position_Size={position_size:.6f}, Win_Rate={win_rate:.2f}, Risk_Reward={risk_reward_ratio:.2f}")
 
         signal_df['total'] = capital
         signal_df['price_volatility'] = scaled_df['price_volatility']
 
-        signal_df = signal_df[['close', 'signal', 'position_size', 'predicted_price', 'rsi', 'macd', 'macd_signal', 'atr', 'vwap', 'adx', 'bb_breakout', 'sentiment_score', 'x_sentiment', 'fear_greed_index', 'whale_moves', 'hash_rate', 'total', 'price_volatility', 'signal_confidence', 'sma_10', 'sma_20', 'take_profit', 'stop_loss']]
+        actual_prices = unscaled_close.values
+        predicted_prices = signal_df['predicted_price'].values
+        if len(actual_prices) == len(predicted_prices):
+            mape = np.mean(np.abs((actual_prices - predicted_prices) / actual_prices)) * 100
+            logging.info(f"Mean Absolute Percentage Error (MAPE) of predictions: {mape:.2f}%")
+            if mape > 5.0:
+                logging.warning(f"High MAPE ({mape:.2f}%) detected. Consider model retraining or reduced reliance on predictions.")
+
+        signal_df = signal_df[['close', 'signal', 'position_size', 'predicted_price', 'rsi', 'macd', 'macd_signal', 'atr', 'vwap', 'adx', 'bb_breakout', 'sentiment_score', 'x_sentiment', 'fear_greed_index', 'whale_moves', 'hash_rate', 'total', 'price_volatility', 'signal_confidence', 'sma_10', 'sma_20', 'take_profit', 'stop_loss', 'trade_outcome']]
         logging.info(f"Generated {len(signal_df)} signals with shape: {signal_df.shape}")
         logging.debug(f"Sample data - predicted_price: {signal_df['predicted_price'].head().to_list()}")
         logging.debug(f"Sample data - position_size: {signal_df['position_size'].head().to_list()}")
@@ -420,19 +652,3 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
     except Exception as e:
         logging.error(f"Error generating signals: {str(e)}")
         raise
-
-def filter_signals(signal_df: pd.DataFrame) -> pd.DataFrame:
-    """Filter signals to enforce a dynamic minimum hold period (24 hours default, 12 hours in high volatility)."""
-    filtered_df = signal_df.copy()
-    last_trade_time = None
-    for idx in filtered_df.index:
-        price_volatility = filtered_df['price_volatility'].loc[idx]
-        min_hold_period = 24
-        if price_volatility > filtered_df['price_volatility'].mean():
-            min_hold_period = 12
-        if last_trade_time is None or (idx - last_trade_time).total_seconds() / 3600 >= min_hold_period:
-            if filtered_df.loc[idx, 'signal'] != 0 and filtered_df.loc[idx, 'signal_confidence'] >= 0.4:
-                last_trade_time = idx
-            continue
-        filtered_df.loc[idx, 'signal'] = 0
-    return filtered_df
