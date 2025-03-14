@@ -1,367 +1,297 @@
 # src/models/train_transformer_model.py
-import asyncio
-import torch
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import pandas as pd
 import logging
+import numpy as np
+import pandas as pd
+import asyncio
+import os
+from sklearn.preprocessing import MinMaxScaler
 import joblib
-import matplotlib.pyplot as plt
-import seaborn as sns
+from src.data.data_fetcher import fetch_historical_data
+from src.models.transformer_model import TransformerPredictor
+from src.utils.sequence_utils import create_sequences
+from src.strategy.indicators import (
+    calculate_rsi, calculate_vpvr, luxalgo_trend_reversal,
+    trendspider_pattern_recognition, metastock_trend_slope
+)
 from src.constants import FEATURE_COLUMNS
-from .transformer_model import TransformerPredictor
-from src.data.data_fetcher import fetch_historical_data  # Absolute import
-from src.data.data_preprocessor import preprocess_data, split_data  # Absolute import
-from typing import List, Optional, Union, Tuple
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.model_selection import KFold
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(message)s')
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 
-# Device setup
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.debug(f"Using device: {device}")
+def train_transformer_model():
+    """
+    Train a Transformer model for price prediction using historical BTC/USD data.
+    Updated to include VPVR and new features (LuxAlgo, TrendSpider, MetaStock) for improved price level awareness.
+    Now includes increased dropout, 5-fold cross-validation, and handles single prediction output during training.
+    Confidence is computed during inference using Monte Carlo Dropout.
+    """
+    # Define the CSV path explicitly
+    csv_path = r"C:\Users\Dennis\.vscode\tradebot\src\data\btc_usd_historical.csv"
+    logging.info(f"Attempting to load data from CSV path: {csv_path}")
 
-def create_sequences(data_features: Union[List, np.ndarray, pd.DataFrame], 
-                    data_target: Union[List, np.ndarray, pd.Series], 
-                    seq_length: int = 34,  # Optimal: context_length (30) + max(lags) (3) + prediction_length (1) = 34
-                    num_time_features: int = 1, 
-                    observed_mask: Optional[Union[List, np.ndarray, pd.DataFrame]] = None):
-    """Create sequences for Transformer input, handling univariate future values separately."""
-    X, y, time_features, observed_masks, future_values, future_time_features = [], [], [], [], [], []
-    required_history = seq_length - 1  # 33 timesteps for history, 1 for future
-    prediction_length = 1  # Predict next value
+    # Verify the CSV file exists
+    if not os.path.exists(csv_path):
+        logging.error(f"CSV file not found at {csv_path}. Please ensure the file exists.")
+        raise FileNotFoundError(f"CSV file not found at {csv_path}")
 
-    # Ensure data_features is a 2D numpy array or list
-    if isinstance(data_features, (pd.DataFrame, pd.Series)):
-        data_features = data_features.values
-    if isinstance(data_features, np.ndarray):
-        logging.debug(f"data_features shape before conversion: {data_features.shape}")
-        if len(data_features.shape) == 1:
-            data_features = data_features.reshape(-1, 1)  # Ensure 2D if 1D
-        elif len(data_features.shape) != 2:
-            raise ValueError(f"data_features must be 2D, got shape {data_features.shape}")
-        data_features = data_features.tolist()
-    elif isinstance(data_features, list):
-        logging.debug(f"data_features is already list, first few rows: {data_features[:2] if data_features else 'Empty'}")
-        if not data_features or not all(isinstance(row, (list, tuple)) for row in data_features):
-            raise ValueError("data_features must be a 2D list [n_samples, n_features]")
-        if not data_features or not data_features[0]:
-            raise ValueError("data_features cannot be empty or contain empty rows")
-    else:
-        raise ValueError(f"Unsupported data_features type: {type(data_features)}")
-    
-    input_dim = len(data_features[0]) if data_features and data_features[0] else 0  # Number of features (17)
-    logging.debug(f"Input dimension (n_features): {input_dim}")
+    # Fetch historical data using CSV
+    data = asyncio.run(fetch_historical_data(
+        symbol='BTC/USD',
+        timeframe='1h',
+        limit=3000,
+        csv_path=csv_path
+    ))
+    logging.info(f"Number of rows fetched: {len(data)}")
+    logging.info(f"Columns: {data.columns.tolist()}")
+    logging.info(f"Initial data shape: {data.shape}")
 
-    # Ensure data_target is a 1D numpy array or list
-    if isinstance(data_target, (pd.DataFrame, pd.Series)):
-        data_target = data_target.values
-    if isinstance(data_target, np.ndarray):
-        logging.debug(f"data_target shape before conversion: {data_target.shape}")
-        if len(data_target.shape) == 2 and data_target.shape[1] == 1:
-            data_target = data_target.flatten()
-        elif len(data_target.shape) != 1:
-            raise ValueError(f"data_target must be 1D, got shape {data_target.shape}")
-        data_target = data_target.tolist()
-    elif isinstance(data_target, list):
-        logging.debug(f"data_target is already list, first few values: {data_target[:2] if data_target else 'Empty'}")
-        if not data_target or not all(isinstance(x, (int, float)) for x in data_target):
-            raise ValueError("data_target must be a 1D list of numbers [n_samples]")
-    else:
-        raise ValueError(f"Unsupported data_target type: {type(data_target)}")
-    
-    n_samples = len(data_features)
-    if n_samples != len(data_target):
-        raise ValueError(f"Length mismatch: data_features has {n_samples} samples, but data_target has {len(data_target)}")
+    # Filter data to 2020 onwards to reduce distribution shift
+    data = data[data.index >= '2020-01-01']
+    logging.info(f"Data after filtering (2020 onwards): {len(data)} rows")
 
-    for i in range(n_samples - required_history - prediction_length + 1):
-        # Past features (history) - ensure exactly 33 steps to match context_length + max(lags)
-        sequence = data_features[i:i + seq_length - 1]  # 33 timesteps
-        logging.debug(f"Sequence {i}: {sequence[:2]}... (length: {len(sequence)}, features: {len(sequence[0]) if sequence and sequence[0] else 0})")
-        if not sequence or not isinstance(sequence, list) or not isinstance(sequence[0], (list, tuple)):
-            raise ValueError(f"Invalid sequence at index {i}: {sequence}, type: {type(sequence)}")
-        if len(sequence) != seq_length - 1 or len(sequence[0]) != input_dim:
-            raise ValueError(f"Sequence {i} shape mismatch: expected [{seq_length - 1}, {input_dim}], got [len(sequence), {len(sequence[0]) if sequence and sequence[0] else 0}]")
-        X.append(sequence)  # Shape [33, n_features], list of lists (full 33 timesteps)
-        # Future features (next value after history) - 1 timestep
-        future_seq = data_features[i + seq_length - 1:i + seq_length]  # 1 timestep
-        if len(future_seq) != 1 or len(future_seq[0]) != input_dim:
-            raise ValueError(f"Future sequence {i} shape mismatch: expected [1, {input_dim}], got [{len(future_seq)}, {len(future_seq[0]) if future_seq and future_seq[0] else 0}]")
-        # Target (next value after history, for loss) - ensure 1D [1]
-        target_value = data_target[i + required_history]
-        logging.debug(f"Target {i}: {target_value} (type: {type(target_value)})")
-        if not isinstance(target_value, (int, float)):
-            raise ValueError(f"Invalid target value at index {i}: {target_value}, type: {type(target_value)}")
-        y.append([target_value])  # Shape [1], wrapped in list for 2D
-        # Past time features (dummy) - ensure exactly 33 steps
-        time_seq = [float(j) / 32 for j in range(33)]  # Shape [33], normalized over 33 steps
-        time_features.append([[val] for val in time_seq])  # Shape [33, 1], list of lists
-        # Past observed mask - ensure exactly 33 steps
-        if observed_mask is not None:
-            if isinstance(observed_mask, (np.ndarray, pd.DataFrame)):
-                observed_mask = observed_mask.tolist()
-            observed_masks.append(observed_mask[i:i + seq_length - 1])  # Full 33 steps
-        else:
-            observed_masks.append([[1] * input_dim for _ in range(seq_length - 1)])  # Shape [33, n_features]
-        # Future values (univariate target, shape [1, 1] for prediction/loss)
-        future_value = [data_target[i + seq_length - 1]]  # Next target value
-        future_values.append([[future_value[0]]])  # Shape [1, 1, 1], list of lists (univariate)
-        # Future time features (dummy, matching prediction_length and num_time_features) - ensure 3D
-        future_time_seq = [float(seq_length - 1) / seq_length]  # Shape [1]
-        future_time_features.append([[[val] for val in future_time_seq]])  # Shape [1, 1, 1], list of lists (3D)
+    # Prepare features and target (use log returns)
+    feature_scaler = MinMaxScaler(feature_range=(0, 1))
+    target_scaler = MinMaxScaler(feature_range=(-1, 1))
 
-    # Convert to torch tensors, ensuring correct shapes
+    # Add basic features
+    data['returns'] = data['close'].pct_change().fillna(0)
+    data['log_returns'] = np.log1p(data['returns']).fillna(0)
+    data['price_volatility'] = data['close'].rolling(window=20).std().bfill()
+    data['sma_20'] = data['close'].rolling(window=20).mean().bfill()
+    data['atr'] = (data['high'] - data['low']).rolling(window=14).mean().bfill()
+    data['vwap'] = (data['close'] * data['volume']).cumsum() / data['volume'].cumsum()
+    data['adx'] = data['close'].diff().abs().rolling(window=14).mean().bfill()
+
+    # Calculate RSI with a warm-up period
+    warm_up_period = 50
+    data['momentum_rsi'] = calculate_rsi(data['close'], window=14)
+    data = data.iloc[warm_up_period:]
+
+    # Add VPVR features
+    vpvr_lookback = 500
+    data['dist_to_poc'] = np.nan
+    data['dist_to_hvn_upper'] = np.nan
+    data['dist_to_hvn_lower'] = np.nan
+    data['dist_to_lvn_upper'] = np.nan
+    data['dist_to_lvn_lower'] = np.nan
+
+    for i in range(vpvr_lookback, len(data)):
+        window_data = data.iloc[max(0, i - vpvr_lookback):i]
+        vpvr = calculate_vpvr(window_data, lookback=vpvr_lookback, num_bins=50)
+        current_price = data['close'].iloc[i]
+        data.iloc[i, data.columns.get_loc('dist_to_poc')] = (current_price - vpvr['poc']) / vpvr['poc'] if vpvr['poc'] != 0 else 0
+        data.iloc[i, data.columns.get_loc('dist_to_hvn_upper')] = (current_price - vpvr['hvn_upper']) / vpvr['hvn_upper'] if vpvr['hvn_upper'] != 0 else 0
+        data.iloc[i, data.columns.get_loc('dist_to_hvn_lower')] = (current_price - vpvr['hvn_lower']) / vpvr['hvn_lower'] if vpvr['hvn_lower'] != 0 else 0
+        data.iloc[i, data.columns.get_loc('dist_to_lvn_upper')] = (current_price - vpvr['lvn_upper']) / vpvr['lvn_upper'] if vpvr['lvn_upper'] != 0 else 0
+        data.iloc[i, data.columns.get_loc('dist_to_lvn_lower')] = (current_price - vpvr['lvn_lower']) / vpvr['lvn_lower'] if vpvr['lvn_lower'] != 0 else 0
+
+    for col in ['dist_to_poc', 'dist_to_hvn_upper', 'dist_to_hvn_lower', 'dist_to_lvn_upper', 'dist_to_lvn_lower']:
+        data[col] = data[col].fillna(0.0)
+
+    # Add new features
+    data['trend_macd'] = data['close'].ewm(span=12, adjust=False).mean() - data['close'].ewm(span=26, adjust=False).mean()
+    data['ema_50'] = data['close'].ewm(span=50, adjust=False).mean()
+    data['bollinger_middle'] = data['close'].rolling(window=20).mean().bfill()
+    data['bollinger_upper'] = data['bollinger_middle'] + 2 * data['close'].rolling(window=20).std().bfill()
+    data['bollinger_lower'] = data['bollinger_middle'] - 2 * data['close'].rolling(window=20).std().bfill()
+    data['luxalgo_signal'] = luxalgo_trend_reversal(data).fillna(0)
+    data['trendspider_signal'] = trendspider_pattern_recognition(data).fillna(0)
+    data['metastock_slope'] = metastock_trend_slope(data).fillna(0)
+
+    # Use feature columns from constants.py
+    logging.info(f"Using feature columns from constants.py: {FEATURE_COLUMNS}")
+
+    # Check for NaN values and fill
+    for col in FEATURE_COLUMNS:
+        if data[col].isna().any():
+            logging.warning(f"Column {col} contains NaN values. Filling with mean.")
+            data[col] = data[col].fillna(data[col].mean())
+
+    # Scale features
+    features_scaled = feature_scaler.fit_transform(data[FEATURE_COLUMNS])
+    logging.info(f"Features scaled: min={features_scaled.min():.2f}, max={features_scaled.max():.2f}")
+
+    # Prepare target (log returns for the next period)
+    data['target'] = data['log_returns'].shift(-1).fillna(0)  # Next period's log return
+    target_scaled = target_scaler.fit_transform(data[['target']])
+    data['target'] = target_scaled.flatten()
+    logging.info(f"Target (log returns) before scaling: min={data['log_returns'].min():.2f}, max={data['log_returns'].max():.2f}")
+    logging.info(f"Target after scaling: min={target_scaled.min():.2f}, max={target_scaled.max():.2f}")
+
+    # Final DataFrame
+    preprocessed_data = data.copy()
+    logging.info(f"Final DataFrame shape: {preprocessed_data.shape}")
+    logging.info(f"Preprocessed columns: {preprocessed_data.columns.tolist()}")
+
+    # Create sequences
+    seq_length = 24  # Match training sequence length
+    X, y, past_time_features, past_observed_mask, future_values, future_time_features = create_sequences(
+        preprocessed_data[FEATURE_COLUMNS].values,
+        preprocessed_data['target'].values,
+        seq_length=seq_length
+    )
+    logging.info(f"Sequence data shape: X={X.shape}, y={y.shape}")
+
+    # Split into train, validation, and test
+    train_size = int(0.7 * len(X))
+    val_size = int(0.15 * len(X))
+    X_train, X_val, X_test = X[:train_size], X[train_size:train_size+val_size], X[train_size+val_size:]
+    y_train, y_val, y_test = y[:train_size], y[train_size:train_size+val_size], y[train_size+val_size:]
+    logging.info(f"Training: {X_train.shape}, Validation: {X_val.shape}, Test: {X_test.shape}")
+
+    # Convert to tensors
+    X_train_tensor = torch.FloatTensor(X_train)
+    y_train_tensor = torch.FloatTensor(y_train)
+    X_val_tensor = torch.FloatTensor(X_val)
+    y_val_tensor = torch.FloatTensor(y_val)
+    X_test_tensor = torch.FloatTensor(X_test)
+    y_test_tensor = torch.FloatTensor(y_test)
+
+    # DataLoader
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32)
+    test_loader = DataLoader(test_dataset, batch_size=32)
+
+    # Update model input dimension to match new FEATURE_COLUMNS length
+    model = TransformerPredictor(input_dim=len(FEATURE_COLUMNS), d_model=128, n_heads=8, n_layers=4, dropout=0.7)
+    logging.info(f"Model initialized with input_dim={len(FEATURE_COLUMNS)}, d_model=128, n_heads=8, n_layers=4, dropout=0.7")
+
+    # Load existing weights for fine-tuning (optional)
     try:
-        X_tensors = [torch.tensor(x, dtype=torch.float32) for x in X]  # List of [33, n_features] tensors
-        logging.debug(f"X tensors before stack: {[x.shape for x in X_tensors[:2]]}")
-        X = torch.stack(X_tensors) if X_tensors else torch.tensor([])  # Shape [n_samples, 33, n_features]
-        y = torch.tensor(y, dtype=torch.float32)  # Shape [n_samples, 1]
-        time_features = torch.tensor(time_features, dtype=torch.float32)  # Shape [n_samples, 33, 1]
-        observed_masks = torch.tensor(observed_masks, dtype=torch.float32) if observed_masks else None  # Shape [n_samples, 33, n_features]
-        future_values = torch.tensor(future_values, dtype=torch.float32)  # Shape [n_samples, 1, 1, 1]
-        future_values = future_values.squeeze(-1)  # Shape [n_samples, 1, 1]
-        future_time_features = torch.tensor(future_time_features, dtype=torch.float32)  # Shape [n_samples, 1, 1, 1]
-        future_time_features = future_time_features.squeeze(-1)  # Shape [n_samples, 1, 1]
+        model.load('best_model.pth')
+        logging.info("Loaded existing model weights for fine-tuning")
     except Exception as e:
-        logging.error(f"Error converting sequences to tensors: {e}")
-        raise
+        logging.warning(f"Failed to load existing model: {e}. Training from scratch.")
 
-    # Log final shapes for debugging
-    logging.debug(f"Final X shape: {X.shape}, y shape: {y.shape}, time_features shape: {time_features.shape}, "
-                  f"observed_masks shape: {observed_masks.shape if observed_masks is not None else 'None'}, "
-                  f"future_values shape: {future_values.shape}, future_time_features shape: {future_time_features.shape}")
+    # Define optimizer and scheduler with adjusted parameters
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=15, min_lr=1e-6)
 
-    return X, y, time_features, observed_masks, future_values, future_time_features
-
-def train(model: TransformerPredictor, X_train: torch.Tensor, y_train: torch.Tensor, X_val: torch.Tensor, y_val: torch.Tensor,
-          past_time_features_train: Optional[torch.Tensor] = None, past_observed_mask_train: Optional[torch.Tensor] = None,
-          past_time_features_val: Optional[torch.Tensor] = None, past_observed_mask_val: Optional[torch.Tensor] = None,
-          future_values_train: Optional[torch.Tensor] = None, future_time_features_train: Optional[torch.Tensor] = None,
-          future_values_val: Optional[torch.Tensor] = None, future_time_features_val: Optional[torch.Tensor] = None,
-          epochs: int = 200, batch_size: int = 32, learning_rate: float = 0.001, patience: int = 10) -> TransformerPredictor:
-    """Train the Transformer model with early stopping and validation."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # Custom training loop with 5-fold cross-validation
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
     criterion = torch.nn.MSELoss()
+
     best_val_loss = float('inf')
-    best_model = model.state_dict()
-    patience_counter = 0
+    kfold = KFold(n_splits=5, shuffle=True, random_state=42)
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(X)):
+        X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+        y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+        X_train_tensor_fold = torch.FloatTensor(X_train_fold)
+        y_train_tensor_fold = torch.FloatTensor(y_train_fold)
+        X_val_tensor_fold = torch.FloatTensor(X_val_fold)
+        y_val_tensor_fold = torch.FloatTensor(y_val_fold)
 
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        for i in range(0, len(X_train), batch_size):
-            batch_x = X_train[i:i + batch_size].to(device).requires_grad_(True)
-            batch_y = y_train[i:i + batch_size].to(device)
+        train_dataset_fold = TensorDataset(X_train_tensor_fold, y_train_tensor_fold)
+        val_dataset_fold = TensorDataset(X_val_tensor_fold, y_val_tensor_fold)
+        train_loader_fold = DataLoader(train_dataset_fold, batch_size=32, shuffle=True)
+        val_loader_fold = DataLoader(val_dataset_fold, batch_size=32)
 
-            batch_past_time = past_time_features_train[i:i + batch_size].to(device) if past_time_features_train is not None else None
-            batch_past_obs = past_observed_mask_train[i:i + batch_size].to(device) if past_observed_mask_train is not None else None
-            batch_future_vals = future_values_train[i:i + batch_size].to(device) if future_values_train is not None else None
-            batch_future_time = future_time_features_train[i:i + batch_size].to(device) if future_time_features_train is not None else None
+        patience_counter = 0
+        fold_best_val_loss = float('inf')
 
-            optimizer.zero_grad()
-            outputs = model(
-                past_values=batch_x,
-                past_time_features=batch_past_time,
-                past_observed_mask=batch_past_obs,
-                future_values=batch_future_vals,
-                future_time_features=batch_future_time
-            )
-            logging.debug(f"Batch {i//batch_size}: outputs shape: {outputs.shape}")
+        for epoch in range(50):
+            model.train()
+            train_loss = 0
+            for batch_X, batch_y in train_loader_fold:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                batch_y = batch_y.view(-1, 1)  # Reshape target to [batch_size, 1] to match output
+                optimizer.zero_grad()
+                prediction = model(batch_X, training=True)
+                loss = criterion(prediction, batch_y)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * batch_X.size(0)
+            train_loss /= len(train_loader_fold.dataset)
+            logging.info(f"Fold {fold+1}, Epoch {epoch+1}/50, Train Loss: {train_loss:.6f}")
 
-            if len(outputs.shape) == 1:
-                outputs = outputs.unsqueeze(-1)
-            elif outputs.shape[1] != 1:
-                outputs = outputs[:, 0:1]
+            # Validation
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader_fold:
+                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                    batch_y = batch_y.view(-1, 1)
+                    prediction = model(batch_X, training=True)
+                    loss = criterion(prediction, batch_y)
+                    val_loss += loss.item() * batch_X.size(0)
+            val_loss /= len(val_loader_fold.dataset)
+            logging.info(f"Fold {fold+1}, Validation Loss: {val_loss:.6f}")
 
-            if len(batch_y.shape) == 1:
-                batch_y = batch_y.reshape(-1, 1)
+            # Scheduler step and log learning rate
+            scheduler.step(val_loss)
+            current_lr = scheduler.get_last_lr()[0]
+            logging.info(f"Fold {fold+1}, Learning Rate: {current_lr:.6f}")
 
-            logging.debug(f"After reshape - outputs shape: {outputs.shape}, batch_y shape: {batch_y.shape}")
-            if outputs.shape != batch_y.shape:
-                logging.error(f"Shape mismatch: outputs {outputs.shape}, batch_y {batch_y.shape}")
-                raise ValueError(f"Shape mismatch in loss calculation")
+            # Early stopping per fold
+            if val_loss < fold_best_val_loss:
+                fold_best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), f'best_model_fold{fold+1}.pth')
+                logging.info(f"Saved best model for fold {fold+1} at epoch {epoch+1}")
+            else:
+                patience_counter += 1
+                if patience_counter >= 15:
+                    logging.info(f"Early stopping for fold {fold+1} at epoch {epoch+1}")
+                    break
 
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+        if fold_best_val_loss < best_val_loss:
+            best_val_loss = fold_best_val_loss
+            torch.save(model.state_dict(), 'best_model.pth')
+            logging.info(f"Updated best overall model at fold {fold+1} with loss {best_val_loss:.6f}")
 
-        avg_train_loss = total_loss / (len(X_train) // batch_size + 1)
-        logging.info(f"Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss:.6f}")
+    # Load best overall model for evaluation
+    model.load_state_dict(torch.load('best_model.pth'))
+    logging.info("Loaded best overall model for evaluation")
 
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            val_outputs = model(
-                past_values=X_val.to(device),
-                past_time_features=past_time_features_val.to(device) if past_time_features_val is not None else None,
-                past_observed_mask=past_observed_mask_val.to(device) if past_observed_mask_val is not None else None,
-                future_values=future_values_val.to(device) if future_values_val is not None else None,
-                future_time_features=future_time_features_val.to(device) if future_time_features_val is not None else None
-            )
+    # Evaluate on test set
+    model.eval()
+    with torch.no_grad():
+        y_pred, y_conf = model.predict(X_test_tensor.to(device))
+    y_test = y_test_tensor.cpu().numpy()
 
-            if len(val_outputs.shape) == 1:
-                val_outputs = val_outputs.unsqueeze(-1)
-            elif val_outputs.shape[1] != 1:
-                val_outputs = val_outputs[:, 0:1]
+    y_test_unscaled = target_scaler.inverse_transform(y_test.reshape(-1, 1))
+    y_pred_unscaled = target_scaler.inverse_transform(y_pred.reshape(-1, 1))
 
-            if len(y_val.shape) == 1:
-                y_val = y_val.reshape(-1, 1)
+    # Convert log returns back to prices for MAE
+    test_data = preprocessed_data.iloc[train_size + val_size:]
+    last_indices = np.arange(len(test_data) - len(y_test), len(test_data)) - seq_length
+    last_close_prices = test_data['close'].iloc[last_indices].values
 
-            val_loss = criterion(val_outputs, y_val.to(device)).item()
-        logging.info(f"Validation Loss: {val_loss:.6f}")
+    if len(last_close_prices) != len(y_test):
+        logging.error(f"Shape mismatch: last_close_prices ({len(last_close_prices)}) vs y_test ({len(y_test)})")
+        raise ValueError("Shape mismatch between last_close_prices and y_test")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model = model.state_dict()
-            patience_counter = 0
-            logging.info(f"Saved best model at epoch {epoch + 1}")
-            torch.save(best_model, 'best_model.pth')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logging.info(f"Early stopping at epoch {epoch + 1}")
-                break
+    # Compute actual and predicted prices for the next hour
+    y_test_prices = last_close_prices * np.exp(y_test_unscaled.flatten())
+    y_pred_prices = last_close_prices * np.exp(y_pred_unscaled.flatten())
 
-    model.load_state_dict(best_model)
-    return model
+    # Calculate MSE and MAE in price space
+    test_mse = np.mean((y_test_prices - y_pred_prices) ** 2)
+    test_mae = np.mean(np.abs(y_test_prices - y_pred_prices))
 
-async def main():
-    """Main function to orchestrate data fetching, preprocessing, scaling, and training."""
-    try:
-        crypto = "BTC/USD"
-        df = await fetch_historical_data(crypto, exchange_name='gemini')
-        logging.info(f"Number of rows fetched: {len(df)}")
-        logging.info(f"Columns: {df.columns}")
-        preprocessed_df = preprocess_data(df)
-        logging.info(f"Preprocessed columns: {preprocessed_df.columns}")
-        logging.info(f"Initial data shape: {preprocessed_df.shape}")
+    # Calculate MAPE for additional insight
+    test_mape = np.mean(np.abs((y_test_prices - y_pred_prices) / y_test_prices)) * 100
 
-        sequence_length = 34  # Optimal: context_length (30) + max(lags) (3) + prediction_length (1) = 34
-        prediction_length = 1  # Matches transformer_model.py
-        required_history = sequence_length - 1  # 33 timesteps for history
-        if len(preprocessed_df) < required_history + prediction_length:
-            raise ValueError(f"Insufficient data for sequence length {required_history + prediction_length}, got {len(preprocessed_df)} rows")
+    logging.info(f"Test MSE (price space): {test_mse:.2f}, MAE (price space): {test_mae:.2f}, MAPE: {test_mape:.2f}%")
 
-        # Define features (17 total)
-        feature_columns = [
-            'open', 'high', 'low', 'volume', 'returns', 'log_returns', 
-            'price_volatility', 'sma_20', 'atr', 'vwap', 'adx', 
-            'momentum_rsi', 'trend_macd', 'ema_50', 'bollinger_upper', 
-            'bollinger_lower', 'bollinger_middle'
-        ]
-        features_data = preprocessed_df[feature_columns].values
-        target_data = preprocessed_df['target'].values
+    # Log sample predictions and confidences for debugging
+    logging.info(f"Sample actual prices (first 5): {y_test_prices[:5].tolist()}")
+    logging.info(f"Sample predicted prices (first 5): {y_pred_prices[:5].tolist()}")
+    logging.info(f"Sample confidences (first 5): {y_conf[:5].flatten().tolist()}")
 
-        # Ensure observed mask is all 1s (fully observed)
-        observed_mask = np.ones_like(features_data, dtype=np.float32)
-
-        # Create sequences
-        X, y, past_time_features, past_observed_mask, future_values, future_time_features = create_sequences(
-            features_data.tolist(), target_data.tolist(), seq_length=sequence_length
-        )
-
-        logging.debug(f"Before split - X shape: {X.shape}, y shape: {y.shape}, past_time_features shape: {past_time_features.shape}, "
-                      f"past_observed_mask shape: {past_observed_mask.shape}, future_time_features shape: {future_time_features.shape}, "
-                      f"future_values shape: {future_values.shape}")
-
-        # Split data (60% train, 20% val, 20% test, no shuffling for time series)
-        X_train, X_temp, y_train, y_temp, past_time_features_train, past_time_features_temp, past_observed_mask_train, past_observed_mask_temp, \
-        future_time_features_train, future_time_features_temp, future_values_train, future_values_temp = train_test_split(
-            X.numpy(), y.numpy(), past_time_features.numpy(), past_observed_mask.numpy(), future_time_features.numpy(), future_values.numpy(),
-            train_size=0.6, test_size=0.4, shuffle=False
-        )
-
-        X_val, X_test, y_val, y_test, past_time_features_val, past_time_features_test, past_observed_mask_val, past_observed_mask_test, \
-        future_time_features_val, future_time_features_test, future_values_val, future_values_test = train_test_split(
-            X_temp, y_temp, past_time_features_temp, past_observed_mask_temp, future_time_features_temp, future_values_temp,
-            train_size=0.5, test_size=0.5, shuffle=False
-        )
-
-        # Convert to PyTorch tensors
-        X_train_tensor = torch.FloatTensor(X_train).to(device).requires_grad_(True)
-        X_val_tensor = torch.FloatTensor(X_val).to(device)
-        X_test_tensor = torch.FloatTensor(X_test).to(device)
-        y_train_tensor = torch.FloatTensor(y_train).to(device)
-        y_val_tensor = torch.FloatTensor(y_val).to(device)
-        y_test_tensor = torch.FloatTensor(y_test).to(device)
-        past_time_features_train_tensor = torch.FloatTensor(past_time_features_train).to(device) if past_time_features_train.size > 0 else None
-        past_time_features_val_tensor = torch.FloatTensor(past_time_features_val).to(device) if past_time_features_val.size > 0 else None
-        past_time_features_test_tensor = torch.FloatTensor(past_time_features_test).to(device) if past_time_features_test.size > 0 else None
-        past_observed_mask_train_tensor = torch.FloatTensor(past_observed_mask_train).to(device) if past_observed_mask_train.size > 0 else None
-        past_observed_mask_val_tensor = torch.FloatTensor(past_observed_mask_val).to(device) if past_observed_mask_val.size > 0 else None
-        past_observed_mask_test_tensor = torch.FloatTensor(past_observed_mask_test).to(device) if past_observed_mask_test.size > 0 else None
-        future_time_features_train_tensor = torch.FloatTensor(future_time_features_train).to(device) if future_time_features_train.size > 0 else None
-        future_time_features_val_tensor = torch.FloatTensor(future_time_features_val).to(device) if future_time_features_val.size > 0 else None
-        future_time_features_test_tensor = torch.FloatTensor(future_time_features_test).to(device) if future_time_features_test.size > 0 else None
-        future_values_train_tensor = torch.FloatTensor(future_values_train).to(device) if future_values_train.size > 0 else None
-        future_values_val_tensor = torch.FloatTensor(future_values_val).to(device) if future_values_val.size > 0 else None
-        future_values_test_tensor = torch.FloatTensor(future_values_test).to(device) if future_values_test.size > 0 else None
-
-        logging.debug(f"After split - X_train shape: {X_train_tensor.shape}, X_val shape: {X_val_tensor.shape}, X_test shape: {X_test_tensor.shape}")
-        logging.debug(f"y_train shape: {y_train_tensor.shape}, y_val shape: {y_val_tensor.shape}, y_test shape: {y_test_tensor.shape}")
-        logging.debug(f"past_time_features_train shape: {past_time_features_train_tensor.shape if past_time_features_train_tensor is not None else 'None'}")
-        logging.debug(f"past_observed_mask_train shape: {past_observed_mask_train_tensor.shape if past_observed_mask_train_tensor is not None else 'None'}")
-        logging.debug(f"future_time_features_train shape: {future_time_features_train_tensor.shape if future_time_features_train_tensor is not None else 'None'}")
-        logging.debug(f"future_values_train shape: {future_values_train_tensor.shape if future_values_train_tensor is not None else 'None'}")
-
-        # Initialize model with 17 features
-        model = TransformerPredictor(input_dim=len(feature_columns), d_model=64, n_heads=4, n_layers=2, dropout=0.1).to(device)
-        trained_model = train(
-            model, X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor,
-            past_time_features_train_tensor, past_observed_mask_train_tensor,
-            past_time_features_val_tensor, past_observed_mask_val_tensor,
-            future_values_train_tensor, future_time_features_train_tensor,
-            future_values_val_tensor, future_time_features_val_tensor,
-            epochs=200, batch_size=32, learning_rate=0.001, patience=10
-        )
-
-        # Evaluate and save predictions
-        trained_model.eval()
-        with torch.no_grad():
-            predictions = trained_model.predict(
-                X_test_tensor.cpu().numpy(),
-                past_time_features_test_tensor.cpu().numpy() if past_time_features_test_tensor is not None else None,
-                past_observed_mask_test_tensor.cpu().numpy() if past_observed_mask_test_tensor is not None else None,
-                future_values_test_tensor.cpu().numpy() if future_values_test_tensor is not None else None,
-                future_time_features_test_tensor.cpu().numpy() if future_time_features_test_tensor is not None else None
-            )
-
-        # Load scalers for inverse transform
-        feature_scaler = joblib.load('feature_scaler.pkl')
-        target_scaler = joblib.load('target_scaler.pkl')
-
-        # Inverse transform predictions and actual values
-        # Ensure y_test_tensor is 2D for inverse_transform
-        y_test_unscaled = target_scaler.inverse_transform(y_test.reshape(-1, 1))
-        predictions_unscaled = target_scaler.inverse_transform(predictions.reshape(-1, 1))
-
-        mse = mean_squared_error(y_test_unscaled, predictions_unscaled)
-        mae = mean_absolute_error(y_test_unscaled, predictions_unscaled)
-        logging.info(f"Test MSE (unscaled): {mse:.2f}, MAE (unscaled): {mae:.2f}")
-
-        # Plot error analysis
-        plt.figure(figsize=(10, 6))
-        sns.scatterplot(x=y_test_unscaled.flatten(), y=np.abs(predictions_unscaled.flatten() - y_test_unscaled.flatten()))
-        plt.xlabel('Actual Values (USD)')
-        plt.ylabel('Absolute Error (USD)')
-        plt.title('Error Analysis (Unscaled BTC/USD Prices)')
-        plt.savefig('error_analysis.png')
-        plt.close()
-
-        # Save the trained model and scalers for backtesting
-        torch.save(trained_model.state_dict(), 'best_model.pth')
-        joblib.dump(feature_scaler, 'feature_scaler.pkl')
-        joblib.dump(target_scaler, 'target_scaler.pkl')
-
-        logging.info("Model training completed and saved as 'best_model.pth'")
-
-    except Exception as e:
-        logging.error(f"Error in main: {e}")
-        raise
+    # Save the model and scalers
+    torch.save(model.state_dict(), 'best_model.pth')
+    joblib.dump(feature_scaler, 'feature_scaler.pkl')
+    joblib.dump(target_scaler, 'target_scaler.pkl')
+    logging.info("Model training completed and saved as 'best_model.pth' with updated scalers")
 
 if __name__ == "__main__":
-    import winloop
-    asyncio.set_event_loop_policy(winloop.EventLoopPolicy())
-    asyncio.run(main())
+    train_transformer_model()

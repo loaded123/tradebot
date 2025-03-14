@@ -3,75 +3,120 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trading Dashboard</title>
+    <title>Trading Bot Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .table-container {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        pre {
+            background: #f4f4f4;
+            padding: 10px;
+            border-radius: 4px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+    </style>
 </head>
-<body>
-
-<h1>Trading Bot Dashboard</h1>
-
-<div id="performance">
-    <p>Profit/Loss: {{ performance.pnl }} USD</p>
-    <p>Number of Trades: {{ performance.num_trades }}</p>
-    <p>Win Rate: {{ (performance.win_rate * 100)|round }}%</p>
-    <p>Last Update: {{ performance.last_update }}</p>
-</div>
-
-<canvas id="pnlChart"></canvas>
-
-<h2>Recent Logs</h2>
-<pre id="logDisplay">
+<body class="bg-gray-100">
+    <div class="container">
+        <h1 class="text-3xl font-bold mb-6 text-center">Trading Bot Dashboard</h1>
+        <div class="card grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+                <p class="text-lg font-semibold">Profit/Loss</p>
+                <p id="pnl" class="text-xl">{{ performance.pnl|default(0) }} USD</p>
+            </div>
+            <div>
+                <p class="text-lg font-semibold">Number of Trades</p>
+                <p id="num_trades" class="text-xl">{{ performance.num_trades|default(0) }}</p>
+            </div>
+            <div>
+                <p class="text-lg font-semibold">Win Rate</p>
+                <p id="win_rate" class="text-xl">{{ (performance.win_rate * 100)|round(2)|default(0) }}%</p>
+            </div>
+            <div>
+                <p class="text-lg font-semibold">Sharpe Ratio</p>
+                <p id="sharpe_ratio" class="text-xl">{{ performance.sharpe_ratio|round(2)|default(0) }}</p>
+            </div>
+            <div>
+                <p class="text-lg font-semibold">Sortino Ratio</p>
+                <p id="sortino_ratio" class="text-xl">{{ performance.sortino_ratio|round(2)|default(0) }}</p>
+            </div>
+            <div>
+                <p class="text-lg font-semibold">Max Drawdown</p>
+                <p id="max_drawdown" class="text-xl">{{ performance.max_drawdown|round(2)|default(0) }}%</p>
+            </div>
+            <div class="col-span-1 md:col-span-3 text-center">
+                <p class="text-lg font-semibold">Last Update</p>
+                <p id="last_update" class="text-xl">{{ performance.last_update|default('N/A') }}</p>
+            </div>
+        </div>
+        <div class="card">
+            <h2 class="text-xl font-bold mb-4">Profit & Loss Over Time</h2>
+            <canvas id="pnlChart" height="100"></canvas>
+            <div id="pnl-timestamps" data-value='{{ performance.pnl_timestamps|tojson|safe|default('[]') }}' style="display: none;"></div>
+            <div id="pnl-values" data-value='{{ performance.pnl_values|tojson|safe|default('[]') }}' style="display: none;"></div>
+        </div>
+        <div class="card">
+            <h2 class="text-xl font-bold mb-4">Recent Trades</h2>
+            <div class="table-container">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="bg-gray-200">
+                            <th class="p-2 border-b">Timestamp</th>
+                            <th class="p-2 border-b">Symbol</th>
+                            <th class="p-2 border-b">Type</th>
+                            <th class="p-2 border-b">Size</th>
+                            <th class="p-2 border-b">Entry Price</th>
+                            <th class="p-2 border-b">Exit Price</th>
+                            <th class="p-2 border-b">Profit/Loss</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tradesTable">
+                        {% if trades %}
+                            {% for trade in trades %}
+                            <tr>
+                                <td class="p-2 border-b">{{ trade.timestamp|default('N/A') }}</td>
+                                <td class="p-2 border-b">{{ trade.symbol|default('N/A') }}</td>
+                                <td class="p-2 border-b">{{ trade.trade_type|default('N/A') }}</td>
+                                <td class="p-2 border-b">{{ trade.size|round(4)|default(0) }}</td>
+                                <td class="p-2 border-b">{{ trade.entry_price|round(2)|default(0) }}</td>
+                                <td class="p-2 border-b">{{ trade.exit_price|round(2) if trade.exit_price is not none else 'N/A' }}</td>
+                                <td class="p-2 border-b {% if trade.profit is not none and trade.profit >= 0 %}text-green-600{% else %}text-red-600{% endif %}">
+                                    {{ trade.profit|round(2) if trade.profit is not none else 'N/A' }}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr><td colspan="7" class="p-2 border-b text-center">No trades available</td></tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div class="card">
+            <h2 class="text-xl font-bold mb-4">Recent Logs</h2>
+            <pre id="logDisplay">
 {% for line in logs %}
 {{ line }}
 {% endfor %}
-</pre>
-
-<script>
-    // Chart.js for a simple PnL chart
-    var ctx = document.getElementById('pnlChart').getContext('2d');
-    var myChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: ['Day 1', 'Day 2', 'Day 3', 'Day 4', 'Day 5'],
-            datasets: [{
-                label: 'PnL',
-                data: [0, 100, 200, 300, 400], // Mock PnL data. Fetch this from your API in real scenario.
-                backgroundColor: 'rgba(0, 119, 204, 0.3)',
-                borderColor: 'rgba(0, 119, 204, 1)',
-                borderWidth: 1
-            }]
-        },
-        options: {
-            scales: {
-                y: {
-                    beginAtZero: true
-                }
-            }
-        }
-    });
-
-    // Real-time updates for logs
-    setInterval(function() {
-        fetch('/api/logs')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('logDisplay').innerHTML = data.logs.join('\n');
-            });
-    }, 5000);  // Update every 5 seconds
-
-    // Real-time updates for performance metrics (you can expand this to update the chart as well)
-    setInterval(function() {
-        fetch('/api/performance')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('performance').innerHTML = 
-                    `<p>Profit/Loss: ${data.pnl} USD</p>
-                     <p>Number of Trades: ${data.num_trades}</p>
-                     <p>Win Rate: ${(data.win_rate * 100).toFixed(2)}%</p>
-                     <p>Last Update: ${data.last_update}</p>`;
-            });
-    }, 10000);  // Update every 10 seconds
-</script>
-
+            </pre>
+        </div>
+    </div>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 </body>
 </html>

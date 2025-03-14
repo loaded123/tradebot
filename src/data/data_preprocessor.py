@@ -1,190 +1,212 @@
 # src/data/data_preprocessor.py
+
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
-from sklearn.preprocessing import MinMaxScaler
-from src.constants import FEATURE_COLUMNS
-import joblib
 import logging
+from typing import List, Dict
+import ta  # Technical Analysis library
+from src.constants import FEATURE_COLUMNS
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger(__name__)
 
-FEATURE_COLUMNS = [
-    'open', 'high', 'low', 'volume', 'returns', 'log_returns',
-    'price_volatility', 'sma_20', 'atr', 'vwap', 'adx',
-    'momentum_rsi', 'trend_macd', 'ema_50', 'bollinger_upper',
-    'bollinger_lower', 'bollinger_middle'
-]
+def calculate_vpvr(data: pd.DataFrame, price_col: str = 'close', volume_col: str = 'volume', num_bins: int = 100) -> Dict[str, pd.Series]:
+    """Calculate Volume Profile Visible Range (VPVR) and distances to key levels."""
+    prices = data[price_col]
+    volumes = data[volume_col]
+    
+    # Create price bins
+    price_range = prices.max() - prices.min()
+    bin_size = price_range / num_bins
+    bins = np.arange(prices.min(), prices.max() + bin_size, bin_size)
+    
+    # Calculate histogram of volume at each price level
+    hist, bin_edges = np.histogram(prices, bins=bins, weights=volumes)
+    
+    # Find Point of Control (POC) - price with highest volume
+    poc_idx = np.argmax(hist)
+    poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2
+    
+    # Find High Volume Nodes (HVN) and Low Volume Nodes (LVN)
+    volume_threshold = np.percentile(hist, 75)  # Top 25% of volume for HVN
+    hvn_mask = hist > volume_threshold
+    lvn_mask = hist < np.percentile(hist, 25)  # Bottom 25% for LVN
+    
+    hvn_prices = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in range(len(hvn_mask)) if hvn_mask[i]]
+    lvn_prices = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in range(len(lvn_mask)) if lvn_mask[i]]
+    
+    hvn_upper = max(hvn_prices) if hvn_prices else poc_price
+    hvn_lower = min(hvn_prices) if hvn_prices else poc_price
+    lvn_upper = max(lvn_prices) if lvn_prices else poc_price
+    lvn_lower = min(lvn_prices) if lvn_prices else poc_price
+    
+    # Calculate distances
+    dist_to_poc = prices - poc_price
+    dist_to_hvn_upper = prices - hvn_upper
+    dist_to_hvn_lower = prices - hvn_lower
+    dist_to_lvn_upper = prices - lvn_upper
+    dist_to_lvn_lower = prices - lvn_lower
+    
+    return {
+        'dist_to_poc': dist_to_poc,
+        'dist_to_hvn_upper': dist_to_hvn_upper,
+        'dist_to_hvn_lower': dist_to_hvn_lower,
+        'dist_to_lvn_upper': dist_to_lvn_upper,
+        'dist_to_lvn_lower': dist_to_lvn_lower
+    }
 
-def remove_outliers(df, columns):
-    """Remove outliers using IQR method, preserving unscaled BTC prices."""
-    df_cleaned = df.copy()
-    for column in columns:
-        if column in ['open', 'high', 'low', 'close']:
-            continue
-        Q1 = df[column].quantile(0.25)
-        Q3 = df[column].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        df_cleaned = df_cleaned[(df_cleaned[column] >= lower_bound) & (df_cleaned[column] <= upper_bound)]
-    return df_cleaned
+def generate_luxalgo_signals(data: pd.DataFrame, trend_threshold: float = 0.01, reversal_threshold: float = 0.005) -> pd.Series:
+    """Generate mock LuxAlgo trend/reversal signals based on price movements."""
+    signals = pd.Series(0, index=data.index, dtype=int)
+    returns = data['close'].pct_change()
+    
+    # Trend signals
+    signals[returns > trend_threshold] = 1  # Uptrend
+    signals[returns < -trend_threshold] = -1  # Downtrend
+    
+    # Reversal signals (mocked based on RSI overbought/oversold)
+    rsi = ta.momentum.RSIIndicator(data['close']).rsi()
+    signals[(rsi > 70) & (returns < -reversal_threshold)] = -1  # Potential reversal down
+    signals[(rsi < 30) & (returns > reversal_threshold)] = 1   # Potential reversal up
+    
+    return signals
 
-def calculate_adx(high, low, close, window=14):
-    """Calculate ADX manually."""
-    df = pd.DataFrame({'high': high, 'low': low, 'close': close})
-    df = df.ffill().bfill().fillna({'high': 79367.5, 'low': 78186.98, 'close': 78877.88})
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift(1)).abs()
-    low_close = (df['low'] - df['close'].shift(1)).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).fillna(500.0)
-    dm_plus = np.where(df['high'] > df['high'].shift(1), df['high'] - df['high'].shift(1), 0)
-    dm_plus = pd.Series(dm_plus).fillna(0)
-    dm_minus = np.where(df['low'] < df['low'].shift(1), df['low'].shift(1) - df['low'], 0)
-    dm_minus = pd.Series(dm_minus).fillna(0)
-    tr_sum = tr.rolling(window=window, min_periods=1).sum().fillna(500.0)
-    dm_plus_sum = dm_plus.rolling(window=window, min_periods=1).sum().fillna(0)
-    dm_minus_sum = dm_minus.rolling(window=window, min_periods=1).sum().fillna(0)
-    di_plus = 100 * (dm_plus_sum / (tr_sum + 1e-10))
-    di_minus = 100 * (dm_minus_sum / (tr_sum + 1e-10))
-    dx = 100 * np.abs(di_plus - di_minus) / (di_plus + di_minus + 1e-10)
-    adx = dx.rolling(window=window, min_periods=1).mean().fillna(25.0)
-    return adx
+def generate_trendspider_signals(data: pd.DataFrame, pattern_window: int = 10) -> pd.Series:
+    """Generate mock TrendSpider pattern signals based on candlestick patterns."""
+    signals = pd.Series(0, index=data.index, dtype=int)
+    returns = data['close'].pct_change()
+    
+    # Mock pattern detection (e.g., higher highs/higher lows for bullish, lower highs/lower lows for bearish)
+    rolling_high = data['high'].rolling(window=pattern_window).max()
+    rolling_low = data['low'].rolling(window=pattern_window).min()
+    signals[(rolling_high > rolling_high.shift(1)) & (rolling_low > rolling_low.shift(1))] = 1  # Bullish pattern
+    signals[(rolling_high < rolling_high.shift(1)) & (rolling_low < rolling_low.shift(1))] = -1  # Bearish pattern
+    
+    return signals
 
-def calculate_vwap(high, low, close, volume):
-    """Calculate VWAP manually."""
-    typical_price = (high + low + close) / 3
-    cumulative_price_volume = (typical_price * volume).cumsum()
-    cumulative_volume = volume.cumsum()
-    vwap = cumulative_price_volume / (cumulative_volume + 1e-10)
-    return vwap.fillna(78877.88)
+def generate_metastock_slope(data: pd.DataFrame, window: int = 20) -> pd.Series:
+    """Generate MetaStock trend slope using a linear regression slope over a window."""
+    def linreg_slope(series):
+        x = np.arange(len(series))
+        slope, _ = np.polyfit(x, series, 1)
+        return slope
+    
+    return data['close'].rolling(window=window).apply(linreg_slope, raw=True).fillna(0)
 
-def calculate_atr(high, low, close, period=14):
-    """Calculate ATR manually."""
-    high_low = high - low
-    high_close = abs(high - close.shift(1))
-    low_close = abs(low - close.shift(1))
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).fillna(500.0)
-    atr = true_range.rolling(window=period, min_periods=14).mean().fillna(500.0)  # Use min_periods=14
-    return atr
+def preprocess_data(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Preprocess raw market data for model input, including technical indicators and new signals.
+    
+    Args:
+        data (pd.DataFrame): Raw market data with columns ['open', 'high', 'low', 'close', 'volume']
+    
+    Returns:
+        pd.DataFrame: Preprocessed DataFrame with all required features
+    """
+    logger.info("Starting data preprocessing...")
+    
+    if not all(col in data.columns for col in ['open', 'high', 'low', 'close', 'volume']):
+        missing = [col for col in ['open', 'high', 'low', 'close', 'volume'] if col not in data.columns]
+        raise ValueError(f"Missing required columns: {missing}")
+    
+    processed_df = data.copy()
+    
+    # Calculate basic features
+    processed_df['returns'] = processed_df['close'].pct_change()
+    processed_df['log_returns'] = np.log1p(processed_df['returns'])
+    processed_df['price_volatility'] = processed_df['close'].rolling(window=20).std()
+    
+    # Simple Moving Average (SMA)
+    processed_df['sma_20'] = processed_df['close'].rolling(window=20).mean()
+    
+    # Average True Range (ATR)
+    processed_df['atr'] = ta.volatility.AverageTrueRange(
+        high=processed_df['high'],
+        low=processed_df['low'],
+        close=processed_df['close'],
+        window=14
+    ).average_true_range()
+    
+    # Volume Weighted Average Price (VWAP)
+    typical_price = (processed_df['high'] + processed_df['low'] + processed_df['close']) / 3
+    processed_df['vwap'] = (typical_price * processed_df['volume']).cumsum() / processed_df['volume'].cumsum()
+    
+    # Average Directional Index (ADX)
+    processed_df['adx'] = ta.trend.ADXIndicator(
+        high=processed_df['high'],
+        low=processed_df['low'],
+        close=processed_df['close'],
+        window=14
+    ).adx()
+    if processed_df['adx'].isna().sum() > 0:
+        logger.warning(f"ADX contains {processed_df['adx'].isna().sum()} NaN values, filling with default")
+        processed_df['adx'] = processed_df['adx'].fillna(0)
+    
+    # Momentum (RSI)
+    processed_df['momentum_rsi'] = ta.momentum.RSIIndicator(close=processed_df['close'], window=14).rsi()
+    
+    # Trend (MACD)
+    macd = ta.trend.MACD(close=processed_df['close'], window_slow=26, window_fast=12)
+    processed_df['trend_macd'] = macd.macd()
+    
+    # Exponential Moving Average (EMA)
+    processed_df['ema_50'] = processed_df['close'].ewm(span=50, adjust=False).mean()
+    
+    # Bollinger Bands
+    bb = ta.volatility.BollingerBands(close=processed_df['close'], window=20, window_dev=2)
+    processed_df['bollinger_upper'] = bb.bollinger_hband()
+    processed_df['bollinger_lower'] = bb.bollinger_lband()
+    processed_df['bollinger_middle'] = bb.bollinger_mavg()  # Corrected from bollinger_mband to bollinger_mavg
+    
+    # VPVR features
+    vpvr_features = calculate_vpvr(processed_df)
+    for key, value in vpvr_features.items():
+        processed_df[key] = value
+    
+    # LuxAlgo signals
+    processed_df['luxalgo_signal'] = generate_luxalgo_signals(processed_df)
+    logger.info(f"Generated LuxAlgo signals: {processed_df['luxalgo_signal'].value_counts().to_dict()}")
+    
+    # TrendSpider signals
+    processed_df['trendspider_signal'] = generate_trendspider_signals(processed_df)
+    logger.info(f"Generated TrendSpider signals: {processed_df['trendspider_signal'].value_counts().to_dict()}")
+    
+    # MetaStock trend slope
+    processed_df['metastock_slope'] = generate_metastock_slope(processed_df)
+    
+    # Handle missing values
+    processed_df = processed_df.fillna(0)
+    
+    # Ensure all required columns are present
+    for col in FEATURE_COLUMNS:
+        if col not in processed_df.columns:
+            logger.warning(f"Feature column {col} not computed, adding with zeros")
+            processed_df[col] = 0
+    
+    logger.info(f"Preprocessed data shape: {processed_df.shape}")
+    logger.info(f"Preprocessed columns: {list(processed_df.columns)}")
+    return processed_df
 
-def preprocess_data(df: pd.DataFrame, feature_scaler=None, target_scaler=None) -> pd.DataFrame:
-    """Preprocess historical OHLCV data."""
-    try:
-        logging.info(f"Initial data shape: {df.shape}")
-        if len(df) < 20:
-            raise ValueError("DataFrame must contain at least 20 rows.")
-        required_columns = ['open', 'high', 'low', 'close', 'volume']
-        for col in required_columns:
-            if col not in df.columns:
-                raise ValueError(f"Missing required column: {col}")
-
-        df_processed = df.copy()
-        if not isinstance(df_processed.index, pd.DatetimeIndex):
-            df_processed.index = pd.to_datetime(df_processed.index, utc=True).tz_localize(None)
-        expected_start = pd.to_datetime('2025-01-01 00:00:00', utc=True).tz_localize(None)
-        expected_end = pd.to_datetime('2025-03-01 23:00:00', utc=True).tz_localize(None)
-        full_range = pd.date_range(start=expected_start, end=expected_end, freq='h')
-        df_processed = df_processed.reindex(full_range, method='ffill').fillna({
-            'open': 78877.88, 'high': 79367.5, 'low': 78186.98, 'close': 78877.88, 'volume': 1000.0
-        })
-
-        price_columns = ['open', 'high', 'low', 'close']
-        for col in price_columns:
-            if df_processed[col].min() < 10000 or df_processed[col].max() > 200000:
-                if df_processed[col].max() > 200000:
-                    df_processed[col] /= 1000
-                elif df_processed[col].min() < 10000:
-                    df_processed[col] *= 1000
-            df_processed[col] = df_processed[col].fillna(78877.88)
-
-        df_processed['returns'] = df_processed['close'].pct_change().fillna(0)
-        df_processed['log_returns'] = np.log1p(df_processed['returns']).fillna(0)
-        df_processed['price_volatility'] = df_processed['log_returns'].rolling(window=14, min_periods=1).std() * np.sqrt(252)
-        df_processed['price_volatility'] = df_processed['price_volatility'].fillna(df_processed['price_volatility'].mean())
-        df_processed['sma_20'] = df_processed['close'].rolling(window=20, min_periods=1).mean().fillna(df_processed['close'].mean())
-        df_processed['atr'] = calculate_atr(df_processed['high'], df_processed['low'], df_processed['close']).fillna(500.0)
-        df_processed['vwap'] = calculate_vwap(df_processed['high'], df_processed['low'], df_processed['close'], df_processed['volume'])
-        df_processed['vwap'] = df_processed['vwap'].fillna(78877.88)
-        df_processed['adx'] = calculate_adx(df_processed['high'], df_processed['low'], df_processed['close']).fillna(25.0)
-        df_processed['momentum_rsi'] = ta.rsi(df_processed['close'], length=14).fillna(50.0)
-        macd_result = ta.macd(df_processed['close'], fast=12, slow=26, signal=9)
-        df_processed['trend_macd'] = macd_result['MACD_12_26_9'].fillna(0)
-        df_processed['ema_50'] = df_processed['close'].ewm(span=50, adjust=False).mean().fillna(df_processed['close'].mean())
-        bbands = ta.bbands(df_processed['close'], length=20, std=2)
-        df_processed['bollinger_upper'] = bbands['BBU_20_2.0'].fillna(df_processed['close'].mean() + 2 * df_processed['close'].std())
-        df_processed['bollinger_lower'] = bbands['BBL_20_2.0'].fillna(df_processed['close'].mean() - 2 * df_processed['close'].std())
-        df_processed['bollinger_middle'] = bbands['BBM_20_2.0'].fillna(df_processed['close'].mean())
-
-        df_processed['target'] = df_processed['close'].shift(-1).ffill().fillna(78877.88)
-        price_columns = ['open', 'high', 'low', 'close']
-        mask = df_processed[price_columns].isna().all(axis=1)
-        df_processed = df_processed[~mask]
-
-        # Ensure all feature columns are present
-        for col in FEATURE_COLUMNS:
-            if col not in df_processed.columns:
-                df_processed[col] = np.nan  # Add missing columns as NaN
-
-        # Fill NaN values for indicators
-        indicator_columns = [col for col in FEATURE_COLUMNS if col not in price_columns]
-        df_processed[indicator_columns] = df_processed[indicator_columns].fillna(df_processed[indicator_columns].mean())
-
-        # Scale indicators and target
-        if feature_scaler is None:
-            feature_scaler = MinMaxScaler()
-        if target_scaler is None:
-            target_scaler = MinMaxScaler()
-
-        scaled_indicators = pd.DataFrame(
-            feature_scaler.fit_transform(df_processed[indicator_columns]),
-            index=df_processed.index,
-            columns=indicator_columns
-        )
-        scaled_target = pd.DataFrame(
-            target_scaler.fit_transform(df_processed[['target']]),
-            index=df_processed.index,
-            columns=['target']
-        )
-
-        # Concatenate price columns, scaled indicators, and scaled target
-        df_processed = pd.concat([df_processed[price_columns], scaled_indicators, scaled_target], axis=1)
-
-        # Ensure 'close' column is preserved
-        if 'close' not in df_processed.columns:
-            raise ValueError("'close' column missing after preprocessing")
-
-        # Select only the required columns
-        final_columns = [col for col in FEATURE_COLUMNS + ['target', 'close'] if col in df_processed.columns]
-        df_processed = df_processed[final_columns]
-
-        joblib.dump(feature_scaler, 'feature_scaler.pkl')
-        joblib.dump(target_scaler, 'target_scaler.pkl')
-
-        logging.info(f"Final DataFrame shape: {df_processed.shape}")
-        return df_processed
-
-    except Exception as e:
-        logging.error(f"Error preprocessing data: {e}")
-        return pd.DataFrame()
-
-def split_data(df, train_ratio=0.8):
-    """Split data into train and test sets."""
-    X = df.drop(columns=['target', 'close'])
-    y = df['target']
-    train_size = int(len(X) * train_ratio)
-    X_train, X_test = X[:train_size], X[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
-    close_train, close_test = df['close'][:train_size], df['close'][train_size:]
-    return X_train, X_test, y_train, y_test, close_train, close_test
-
-if __name__ == "__main__":
-    dummy_data = pd.DataFrame({
-        'open': np.linspace(80000, 81000, 1440),
-        'high': np.linspace(80100, 81100, 1440),
-        'low': np.linspace(79900, 80900, 1440),
-        'close': np.linspace(80000, 81000, 1440),
-        'volume': [1000] * 1440
-    }, index=pd.date_range("2025-01-01", periods=1440, freq="h"))
-    preprocessed = preprocess_data(dummy_data)
-    print(f"Preprocessed data:\n{preprocessed.head()}")
+def scale_features(data: pd.DataFrame, feature_columns: List[str]) -> pd.DataFrame:
+    """
+    Scale features to [0, 1] range.
+    
+    Args:
+        data (pd.DataFrame): Preprocessed data
+        feature_columns (List[str]): Columns to scale
+    
+    Returns:
+        pd.DataFrame: Scaled DataFrame
+    """
+    scaled_df = data.copy()
+    for col in feature_columns:
+        if col in scaled_df.columns:
+            min_val = scaled_df[col].min()
+            max_val = scaled_df[col].max()
+            if max_val != min_val:
+                scaled_df[col] = (scaled_df[col] - min_val) / (max_val - min_val)
+            else:
+                scaled_df[col] = 0
+            logger.info(f"Feature {col}: min={min_val:.4f}, max={max_val:.4f}, mean={scaled_df[col].mean():.4f}")
+        else:
+            logger.warning(f"Feature {col} not found in DataFrame, skipping scaling")
+    return scaled_df

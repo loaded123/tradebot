@@ -4,6 +4,8 @@ import pandas as pd
 import ccxt.async_support as ccxt
 import logging
 import os
+from datetime import datetime
+import csv
 
 # Configure logging
 script_dir = os.path.abspath(os.path.dirname(__file__))
@@ -21,21 +23,64 @@ logging.basicConfig(
 )
 logger = logging.getLogger('data_fetcher')
 
-async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_name='gemini'):
+async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_name='bitfinex', csv_path=None):
     """
-    Fetch historical OHLCV data asynchronously from a specified exchange, ensuring full date range from Jan 1, 2025, to Mar 1, 2025,
-    with robust timestamp handling for millisecond timestamps on Gemini and Kraken.
+    Fetch historical OHLCV data asynchronously from a specified exchange or load from a CSV file.
     
     Args:
         symbol (str): Trading pair (e.g., 'BTC/USD')
         timeframe (str): Timeframe for OHLCV (e.g., '1h')
-        limit (int): Number of data points to fetch
-        exchange_name (str): Name of the exchange (e.g., 'gemini', 'kraken')
+        limit (int): Maximum number of data points to fetch per request
+        exchange_name (str): Name of the exchange (e.g., 'bitfinex', 'gemini')
+        csv_path (str, optional): Path to a local CSV file with OHLCV data
     
     Returns:
-        pd.DataFrame: OHLCV data with unscaled prices and full date range
+        pd.DataFrame: OHLCV data with unscaled prices
     """
-    exchanges = ['gemini', 'kraken']
+    current_date = datetime.utcnow().replace(hour=23, minute=0, second=0, microsecond=0)
+
+    # Prioritize CSV if provided and exists
+    if csv_path and os.path.exists(csv_path):
+        logger.info(f"Loading data from CSV: {csv_path}")
+        try:
+            df = pd.read_csv(csv_path)
+            required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required_columns):
+                raise ValueError(f"CSV file must contain the following columns: {required_columns}")
+            # Handle various timestamp formats
+            for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d', int]:
+                try:
+                    if df['timestamp'].dtype == 'int64' or df['timestamp'].dtype == 'float64':
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s' if df['timestamp'].dtype == 'int64' else 'ms', utc=True, errors='coerce')
+                    else:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], format=fmt, utc=True, errors='coerce')
+                    break
+                except ValueError:
+                    continue
+            if df['timestamp'].isna().all():
+                raise ValueError("Unable to parse timestamp column in CSV")
+            df = df.dropna(subset=['timestamp'])
+            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+            df = df.set_index('timestamp')
+            full_range = pd.date_range(start=df.index.min(), end=current_date, freq='h')
+            df = df.reindex(full_range)
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].ffill()
+            df['open'] = df['open'].fillna(df['open'].mean() if not df['open'].isna().all() else 78877.88)
+            df['high'] = df['high'].fillna(df['high'].mean() if not df['high'].isna().all() else 79367.5)
+            df['low'] = df['low'].fillna(df['low'].mean() if not df['low'].isna().all() else 78186.98)
+            df['close'] = df['close'].fillna(df['close'].mean() if not df['close'].isna().all() else 78877.88)
+            df['volume'] = df['volume'].fillna(df['volume'].mean() if not df['volume'].isna().all() else 1000.0)
+            logger.info(f"Loaded {len(df)} rows from CSV file")
+            return df
+        except Exception as e:
+            logger.error(f"Error loading CSV file {csv_path}: {e}")
+            raise ValueError(f"Failed to load data from CSV file: {e}")
+
+    # Fallback to exchange if no CSV is provided
+    logger.warning("No valid CSV path provided, falling back to exchange data fetching")
+    exchanges = ['bitfinex', 'gemini']
+    max_iterations = 1000  # Prevent infinite looping
+
     for current_exchange in exchanges:
         try:
             exchange = getattr(ccxt, current_exchange)({
@@ -44,85 +89,91 @@ async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_nam
             })
 
             adjusted_symbol = symbol
-            if current_exchange.lower() == 'kraken' and symbol == 'BTC/USD':
-                adjusted_symbol = 'XXBTZUSD'
+            if current_exchange.lower() == 'bitfinex' and symbol == 'BTC/USD':
+                adjusted_symbol = 'BTC/USD'
+                logger.info(f"Adjusted symbol to {adjusted_symbol} for {current_exchange}")
+            elif current_exchange.lower() == 'gemini' and symbol == 'BTC/USD':
+                adjusted_symbol = 'BTC/USD'
                 logger.info(f"Adjusted symbol to {adjusted_symbol} for {current_exchange}")
 
-            start_date = pd.to_datetime('2025-01-01 00:00:00', utc=True).tz_localize(None)
-            end_date = pd.to_datetime('2025-03-01 23:00:00', utc=True).tz_localize(None)
-            start_timestamp = start_date.timestamp() * 1000
-            end_timestamp = end_date.timestamp() * 1000
+            # Initial fetch to determine the earliest available data
+            initial_timestamp = pd.to_datetime('2020-01-01 00:00:00', utc=True).timestamp() * 1000
+            try:
+                initial_ohlcv = await exchange.fetch_ohlcv(adjusted_symbol, timeframe, int(initial_timestamp), 1)
+                if initial_ohlcv:
+                    start_timestamp = initial_ohlcv[0][0]
+                    logger.info(f"Earliest available timestamp from {current_exchange}: {pd.to_datetime(start_timestamp, unit='ms')}")
+                else:
+                    start_timestamp = pd.to_datetime('2024-12-01 00:00:00', utc=True).timestamp() * 1000
+                    logger.warning(f"No initial data from {current_exchange}, using fallback start: {pd.to_datetime(start_timestamp, unit='ms')}")
+            except Exception as e:
+                logger.error(f"Failed to fetch initial timestamp from {current_exchange}: {e}")
+                start_timestamp = pd.to_datetime('2024-12-01 00:00:00', utc=True).timestamp() * 1000
+                logger.warning(f"Using fallback start timestamp: {pd.to_datetime(start_timestamp, unit='ms')}")
 
+            end_timestamp = current_date.timestamp() * 1000
             all_ohlcv = []
             current_timestamp = start_timestamp
-            while current_timestamp < end_timestamp:
+            chunk_size = 100
+            last_fetched_timestamp = start_timestamp
+            rate_limit_delay = 10
+            iteration_count = 0
+
+            while current_timestamp < end_timestamp and iteration_count < max_iterations:
                 attempt = 0
-                max_retries = 5
+                max_retries = 3
+                fetched_data = False
                 while attempt < max_retries:
                     try:
                         async with asyncio.timeout(30):
-                            ohlcv = await exchange.fetch_ohlcv(adjusted_symbol, timeframe, int(current_timestamp), limit=min(limit, 1000))
+                            ohlcv = await exchange.fetch_ohlcv(adjusted_symbol, timeframe, int(current_timestamp), chunk_size)
                         if not ohlcv:
-                            logger.warning(f"No OHLCV data returned for {adjusted_symbol} on {current_exchange}")
+                            logger.warning(f"No OHLCV data returned for {adjusted_symbol} on {current_exchange} at timestamp {current_timestamp}")
                             break
                         logger.debug(f"Sample OHLCV data for {adjusted_symbol} on {current_exchange}: {ohlcv[:5]}")
                         all_ohlcv.extend(ohlcv)
-                        current_timestamp = ohlcv[-1][0] + (60 * 60 * 1000)
+                        last_fetched_timestamp = ohlcv[-1][0]
+                        current_timestamp = last_fetched_timestamp + (60 * 60 * 1000)
+                        fetched_data = True
                         break
-                    except asyncio.TimeoutError as e:
-                        logger.error(f"Timeout fetching OHLCV data for {adjusted_symbol} on {current_exchange} (attempt {attempt + 1}/{max_retries}): {e}")
-                        if attempt < max_retries - 1:
+                    except ccxt.BadSymbol as e:
+                        logger.error(f"BadSymbol error for {adjusted_symbol} on {current_exchange}: {e}")
+                        raise
+                    except (asyncio.TimeoutError, ccxt.NetworkError, ccxt.ExchangeError) as e:
+                        logger.error(f"Error fetching OHLCV data for {adjusted_symbol} on {current_exchange} (attempt {attempt + 1}/{max_retries}): {e}")
+                        attempt += 1
+                        if attempt < max_retries:
                             await asyncio.sleep(5)
                         else:
-                            raise
-                    except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                        logger.error(f"Network/Exchange error for {adjusted_symbol} on {current_exchange} (attempt {attempt + 1}/{max_retries}): {e}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(5)
-                        else:
-                            raise
-                    attempt += 1
+                            logger.error(f"Max retries reached for timestamp {current_timestamp}, advancing timestamp")
+                            break
+                    except asyncio.CancelledError as e:
+                        logger.error(f"CancelledError for {adjusted_symbol} on {current_exchange} at timestamp {current_timestamp}: {e}")
+                        raise
+
+                if not fetched_data:
+                    current_timestamp += chunk_size * 3600000
+                    logger.warning(f"No data fetched, advancing timestamp to {current_timestamp}")
+                await asyncio.sleep(rate_limit_delay)
+                iteration_count += 1
 
             if not all_ohlcv:
                 raise ValueError(f"No OHLCV data fetched for {adjusted_symbol} on {current_exchange}")
 
-            # Convert to DataFrame with robust timestamp handling
             df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            logger.debug(f"DataFrame shape: {df.shape}")
-            logger.debug(f"Raw timestamp data type: {df['timestamp'].dtype}")
-            logger.debug(f"Sample raw timestamps: {df['timestamp'].head().tolist()}")
-
-            # Convert timestamps to datetime
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True, errors='coerce')
-            logger.debug(f"After conversion, timestamp dtype: {df['timestamp'].dtype}")
-            logger.debug(f"Sample converted timestamps: {df['timestamp'].head().tolist()}")
-
-            # Check for NaT values
-            if df['timestamp'].isna().any():
-                logger.warning(f"NaT values found in timestamp column: {df['timestamp'].isna().sum()} rows")
-                df = df.dropna(subset=['timestamp'])
-
-            # Remove timezone to ensure naive datetime
+            df = df.dropna(subset=['timestamp'])
             df['timestamp'] = df['timestamp'].dt.tz_localize(None)
-            logger.debug(f"After tz_localize(None), timestamp dtype: {df['timestamp'].dtype}")
-            logger.debug(f"Sample naive timestamps: {df['timestamp'].head().tolist()}")
+            df = df.set_index('timestamp')
 
-            # Set timestamp as index
-            df = df.set_index('timestamp')  # Avoid inplace=True for clarity
-            logger.debug(f"After set_index, index type: {type(df.index)}")
-            logger.debug(f"Sample index values: {df.index[:5].tolist()}")
-
-            # Check if index is DatetimeIndex
-            if not isinstance(df.index, pd.DatetimeIndex):
-                logger.error(f"Index is not a DatetimeIndex: {type(df.index)}, Sample: {df.index[:5].tolist()}")
-                raise ValueError(f"Failed to create DatetimeIndex for {adjusted_symbol} on {current_exchange}")
-
-            # Reindex to full date range
-            full_range = pd.date_range(start=start_date, end=end_date, freq='h')
-            df = df.reindex(full_range, method='ffill').fillna({
-                'open': 78877.88, 'high': 79367.5, 'low': 78186.98, 'close': 78877.88, 'volume': 1000.0
-            })
-
+            full_range = pd.date_range(start=pd.to_datetime(start_timestamp, unit='ms'), end=current_date, freq='h')
+            df = df.reindex(full_range)
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].ffill()
+            df['open'] = df['open'].fillna(df['open'].mean() if not df['open'].isna().all() else 78877.88)
+            df['high'] = df['high'].fillna(df['high'].mean() if not df['high'].isna().all() else 79367.5)
+            df['low'] = df['low'].fillna(df['low'].mean() if not df['low'].isna().all() else 78186.98)
+            df['close'] = df['close'].fillna(df['close'].mean() if not df['close'].isna().all() else 78877.88)
+            df['volume'] = df['volume'].fillna(df['volume'].mean() if not df['volume'].isna().all() else 1000.0)
             logger.info(f"Fetched {len(df)} rows from {current_exchange} for {adjusted_symbol}")
             return df
 
@@ -133,10 +184,10 @@ async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_nam
             if 'exchange' in locals():
                 await exchange.close()
 
-    logger.error(f"Failed to fetch data from all exchanges: {exchanges}")
-    return pd.DataFrame()
+    logger.error("Failed to fetch data from all exchanges and no valid CSV path provided")
+    raise ValueError("Unable to fetch data from exchanges or CSV file")
 
-async def fetch_real_time_ws(symbol, exchange_name='gemini'):
+async def fetch_real_time_ws(symbol, exchange_name='bitfinex'):
     """
     Fetch real-time data via WebSocket from the specified exchange.
     
@@ -144,7 +195,7 @@ async def fetch_real_time_ws(symbol, exchange_name='gemini'):
     
     Args:
         symbol (str): Trading pair (e.g., 'BTC/USD')
-        exchange_name (str): Name of the exchange (e.g., 'gemini', 'kraken')
+        exchange_name (str): Name of the exchange (e.g., 'bitfinex', 'gemini')
     
     Yields:
         dict: Real-time data (e.g., {'timestamp': ..., 'price': ...})
