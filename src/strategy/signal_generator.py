@@ -23,8 +23,8 @@ from src.strategy.market_regime import detect_market_regime
 
 # Configure main logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s', force=True)
-logging.info("Using UPDATED signal_generator.py - Mar 14, 2025 - VERSION 83.6 (Added LuxAlgo, TrendSpider, SMRT, MetaStock, HassOnline, MCD Integration, Fixed reindex and Bollinger Bands)")
-print("signal_generator.py loaded - Mar 14, 2025 - VERSION 83.6 (Added LuxAlgo, TrendSpider, SMRT, MetaStock, HassOnline, MCD Integration, Fixed reindex and Bollinger Bands)")
+logging.info("Using UPDATED signal_generator.py - Mar 14, 2025 - VERSION 83.7 (Added LuxAlgo, TrendSpider, SMRT, MetaStock, HassOnline, MCD Integration, Fixed dtype warning, Optimized signals)")
+print("signal_generator.py loaded - Mar 14, 2025 - VERSION 83.7 (Added LuxAlgo, TrendSpider, SMRT, MetaStock, HassOnline, MCD Integration, Fixed dtype warning, Optimized signals)")
 
 # Configure separate loggers with summarized output
 sentiment_logger = logging.getLogger('sentiment')
@@ -118,12 +118,12 @@ def filter_signals(signal_df: pd.DataFrame) -> pd.DataFrame:
     """Filter signals to enforce a minimum hold period, dynamically adjusted by price volatility."""
     filtered_df = signal_df.copy()
     last_trade_time = None
-    min_hold_period = 4  # 4 hours
+    min_hold_period = 6  # Increased to 6 hours to reduce overtrading
     for idx in filtered_df.index:
         current_signal = filtered_df.loc[idx, 'signal']
         price_volatility = filtered_df.loc[idx, 'price_volatility'] if 'price_volatility' in filtered_df.columns else 0.0
-        dynamic_min_hold = min_hold_period if price_volatility > filtered_df['price_volatility'].mean() else 2
-        min_confidence = 0.15  # Reduced from 0.2
+        dynamic_min_hold = min_hold_period if price_volatility > filtered_df['price_volatility'].mean() else 3
+        min_confidence = 0.2  # Increased from 0.15 to 0.2 to improve signal quality
         # Relaxed criteria: Allow 0 confirming indicators if confidence is high
         rsi = filtered_df.loc[idx, 'rsi']
         macd = filtered_df.loc[idx, 'macd']
@@ -132,19 +132,19 @@ def filter_signals(signal_df: pd.DataFrame) -> pd.DataFrame:
         if current_signal == 1:
             if rsi < filtered_df.loc[idx, 'rsi_buy_threshold'] and macd > macd_signal:
                 confirming_indicators = 2
-            elif (rsi < filtered_df.loc[idx, 'rsi_buy_threshold'] or macd > macd_signal) and filtered_df.loc[idx, 'signal_confidence'] >= 0.4:  # Reduced from 0.5
+            elif (rsi < filtered_df.loc[idx, 'rsi_buy_threshold'] or macd > macd_signal) and filtered_df.loc[idx, 'signal_confidence'] >= 0.4:
                 confirming_indicators = 1
         elif current_signal == -1:
             if rsi > filtered_df.loc[idx, 'rsi_sell_threshold'] and macd < macd_signal:
                 confirming_indicators = 2
-            elif (rsi > filtered_df.loc[idx, 'rsi_sell_threshold'] or macd < macd_signal) and filtered_df.loc[idx, 'signal_confidence'] >= 0.4:  # Reduced from 0.5
+            elif (rsi > filtered_df.loc[idx, 'rsi_sell_threshold'] or macd < macd_signal) and filtered_df.loc[idx, 'signal_confidence'] >= 0.4:
                 confirming_indicators = 1
 
         if (last_trade_time is None or 
             (idx - last_trade_time).total_seconds() / 3600 >= dynamic_min_hold) and \
            current_signal != 0 and \
            filtered_df.loc[idx, 'signal_confidence'] >= min_confidence and \
-           (confirming_indicators >= 1 or filtered_df.loc[idx, 'signal_confidence'] >= 0.4):  # Allow 0 indicators if confidence is high
+           (confirming_indicators >= 1 or filtered_df.loc[idx, 'signal_confidence'] >= 0.4):
             last_trade_time = idx
             signals_logger.info(f"Accepted signal at {idx} with confidence {filtered_df.loc[idx, 'signal_confidence']:.2f}, Indicators confirmed: {confirming_indicators}")
         else:
@@ -400,7 +400,7 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
         signal_df = scaled_df.copy()
         # Adjust index to account for sequence length
         signal_df = signal_df.iloc[24:].copy()
-        signal_df['predicted_price'] = pd.Series(predictions_unscaled, index=signal_df.index)
+        signal_df['predicted_price'] = pd.Series(predictions_unscaled, index=signal_df.index, dtype=np.float64)
         signal_df['raw_predicted_price'] = signal_df['predicted_price'].copy()
         signal_df['model_confidence'] = pd.Series(confidences.flatten(), index=signal_df.index)
 
@@ -409,6 +409,7 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
         unscaled_low = preprocessed_data['low'].copy()
         unscaled_volume = preprocessed_data['volume'].copy()
 
+        # Validate and correct unscaled prices
         if unscaled_close.isna().any() or unscaled_high.isna().any() or unscaled_low.isna().any() or unscaled_volume.isna().any():
             logging.warning("Unscaled prices or volume contain NaN values. Filling with previous valid values or defaults.")
             unscaled_close = unscaled_close.fillna(method='ffill').fillna(78877.88)
@@ -416,10 +417,10 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
             unscaled_low = unscaled_low.fillna(method='ffill').fillna(78186.98)
             unscaled_volume = unscaled_volume.fillna(method='ffill').fillna(1000.0)
         if (unscaled_close <= 0).any() or (unscaled_close < 10000).any() or (unscaled_close > 200200).any():
-            logging.warning("Unscaled prices appear scaled or invalid. Correcting to default BTC price range.")
-            unscaled_close = unscaled_close.apply(lambda x: 78877.88 if x <= 0 or x < 10000 or x > 200200 else x)
-            unscaled_high = unscaled_high.apply(lambda x: 79367.5 if x <= 0 or x < 10000 or x > 200200 else x)
-            unscaled_low = unscaled_low.apply(lambda x: 78186.98 if x <= 0 or x < 10000 or x > 200200 else x)
+            logging.warning("Unscaled close contains invalid values. Correcting to default BTC price range.")
+            unscaled_close = unscaled_close.apply(lambda x: 78877.88 if x <= 0 or pd.isna(x) or x < 10000 or x > 200200 else x)
+            unscaled_high = unscaled_high.apply(lambda x: 79367.5 if x <= 0 or pd.isna(x) or x < 10000 or x > 200200 else x)
+            unscaled_low = unscaled_low.apply(lambda x: 78186.98 if x <= 0 or pd.isna(x) or x < 10000 or x > 200200 else x)
 
         avg_error = 0
         window = 24
@@ -430,7 +431,8 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
             else:
                 errors = [p - unscaled_close.loc[idx] for idx, p in zip(signal_df.index[i-window+1:i+1], signal_df['raw_predicted_price'][i-window+1:i+1])]
             avg_error = np.mean(errors) if errors else avg_error
-            signal_df.loc[idx, 'predicted_price'] = signal_df.loc[idx, 'raw_predicted_price'] - avg_error
+            # Explicitly cast to float to avoid dtype warning
+            signal_df.loc[idx, 'predicted_price'] = float(signal_df.loc[idx, 'raw_predicted_price'] - avg_error)
         logging.info(f"Final average prediction error after rolling correction: {avg_error:.2f} USD")
 
         signal_df['rsi'] = calculate_rsi(unscaled_close).reindex(signal_df.index, method='ffill')
@@ -541,8 +543,6 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
         for idx in signal_df.index:
             unscaled_close_val = unscaled_close.loc[idx]
             unscaled_atr_val = signal_df['atr'].loc[idx]
-            unscaled_rsi = signal_df['rsi'].loc[idx]
-            unscaled_macd = signal_df['macd'].loc[idx]
             sma_10 = signal_df['sma_10'].loc[idx]
             sma_20 = signal_df['sma_20'].loc[idx]
             sma_50 = signal_df['sma_50'].loc[idx]
@@ -569,6 +569,8 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
             smrt_signal = signal_df['smrt_signal'].loc[idx]
             arbitrage_signal = signal_df['arbitrage_signal'].loc[idx]
             metastock_slope = signal_df['metastock_slope'].loc[idx]
+            unscaled_rsi = signal_df['rsi'].loc[idx]
+            unscaled_macd = signal_df['macd'].loc[idx]
 
             if pd.isna(unscaled_atr_val):
                 unscaled_atr_val = 500.0
@@ -578,7 +580,7 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
 
             trend = 'bullish' if sma_50 > sma_200 else 'bearish' if sma_50 < sma_200 else 'neutral'
             confidence = 0.0
-            price_change_threshold = 0.0005 * unscaled_close_val  # Reduced to 0.05%
+            price_change_threshold = 0.001 * unscaled_close_val  # Increased to 0.1% to reduce false signals
 
             # Modified volatility adjustment: Reduce position size
             volatility_adjustment = 1.0
@@ -726,17 +728,17 @@ async def generate_signals(scaled_df: pd.DataFrame, preprocessed_data: pd.DataFr
                 signals_logger.info(f"Arbitrage Signal Override at {idx}: Signal={arbitrage_signal}, Confidence={confidence:.2f}")
 
             signal_df.loc[idx, 'signal_confidence'] = min(1.0, max(0.0, confidence + combined_confidence))
-            if signal_df.loc[idx, 'signal_confidence'] < 0.15:
+            if signal_df.loc[idx, 'signal_confidence'] < 0.2:
                 logging.warning(f"Low signal_confidence at {idx}: {signal_df.loc[idx, 'signal_confidence']}")
 
         initial_buy_count = (signal_df['signal'] == 1).sum()
         initial_sell_count = (signal_df['signal'] == -1).sum()
-        low_confidence_count = (signal_df['signal_confidence'] < 0.15).sum()
+        low_confidence_count = (signal_df['signal_confidence'] < 0.2).sum()
         signals_logger.info(
             f"Initial Signal Summary: Buy Signals: {initial_buy_count}, Sell Signals: {initial_sell_count}, "
             f"Confidence Mean: {signal_df['signal_confidence'].mean():.2f}, "
             f"Confidence Std: {signal_df['signal_confidence'].std():.2f}, "
-            f"Low Confidence (<0.15): {low_confidence_count}"
+            f"Low Confidence (<0.2): {low_confidence_count}"
         )
 
         # Log signals per year to debug distribution
