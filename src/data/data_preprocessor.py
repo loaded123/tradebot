@@ -1,11 +1,12 @@
 # src/data/data_preprocessor.py
-
 import pandas as pd
 import numpy as np
 import logging
 from typing import List, Dict
 import ta  # Technical Analysis library
+from src.utils.time_utils import calculate_days_to_next_halving
 from src.constants import FEATURE_COLUMNS
+from src.strategy.signal_filter import smrt_scalping_signals
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +111,20 @@ def preprocess_data(data: pd.DataFrame) -> pd.DataFrame:
     
     processed_df = data.copy()
     
+    # Ensure datetime index
+    if not pd.api.types.is_datetime64_any_dtype(processed_df.index):
+        processed_df.index = pd.to_datetime(processed_df.index)
+    processed_df = processed_df.sort_index()
+
+    # Validate and correct invalid close prices
+    if (processed_df['close'] <= 0).any() or (processed_df['close'] < 10000).any() or (processed_df['close'] > 200200).any():
+        logger.warning("Close prices contain invalid values. Correcting to default BTC price range.")
+        processed_df['close'] = processed_df['close'].apply(lambda x: 78877.88 if x <= 0 or pd.isna(x) or x < 10000 or x > 200200 else x)
+
     # Calculate basic features
     processed_df['returns'] = processed_df['close'].pct_change()
     processed_df['log_returns'] = np.log1p(processed_df['returns'])
-    processed_df['price_volatility'] = processed_df['close'].rolling(window=20).std()
+    processed_df['price_volatility'] = processed_df['log_returns'].rolling(window=24).std().fillna(0)
     
     # Simple Moving Average (SMA)
     processed_df['sma_20'] = processed_df['close'].rolling(window=20).mean()
@@ -124,11 +135,12 @@ def preprocess_data(data: pd.DataFrame) -> pd.DataFrame:
         low=processed_df['low'],
         close=processed_df['close'],
         window=14
-    ).average_true_range()
+    ).average_true_range().fillna(500.0)  # Default ATR value
     
     # Volume Weighted Average Price (VWAP)
     typical_price = (processed_df['high'] + processed_df['low'] + processed_df['close']) / 3
     processed_df['vwap'] = (typical_price * processed_df['volume']).cumsum() / processed_df['volume'].cumsum()
+    processed_df['vwap'] = processed_df['vwap'].ffill().fillna(0)  # Updated to use ffill instead of deprecated method
     
     # Average Directional Index (ADX)
     processed_df['adx'] = ta.trend.ADXIndicator(
@@ -136,17 +148,15 @@ def preprocess_data(data: pd.DataFrame) -> pd.DataFrame:
         low=processed_df['low'],
         close=processed_df['close'],
         window=14
-    ).adx()
-    if processed_df['adx'].isna().sum() > 0:
-        logger.warning(f"ADX contains {processed_df['adx'].isna().sum()} NaN values, filling with default")
-        processed_df['adx'] = processed_df['adx'].fillna(0)
+    ).adx().fillna(10.0)  # Default ADX value
     
     # Momentum (RSI)
-    processed_df['momentum_rsi'] = ta.momentum.RSIIndicator(close=processed_df['close'], window=14).rsi()
+    processed_df['momentum_rsi'] = ta.momentum.RSIIndicator(close=processed_df['close'], window=14).rsi().fillna(50.0)
     
     # Trend (MACD)
     macd = ta.trend.MACD(close=processed_df['close'], window_slow=26, window_fast=12)
-    processed_df['trend_macd'] = macd.macd()
+    processed_df['trend_macd'] = macd.macd().fillna(0)
+    processed_df['macd_signal'] = macd.macd_signal().fillna(0)
     
     # Exponential Moving Average (EMA)
     processed_df['ema_50'] = processed_df['close'].ewm(span=50, adjust=False).mean()
@@ -155,12 +165,22 @@ def preprocess_data(data: pd.DataFrame) -> pd.DataFrame:
     bb = ta.volatility.BollingerBands(close=processed_df['close'], window=20, window_dev=2)
     processed_df['bollinger_upper'] = bb.bollinger_hband()
     processed_df['bollinger_lower'] = bb.bollinger_lband()
-    processed_df['bollinger_middle'] = bb.bollinger_mavg()  # Corrected from bollinger_mband to bollinger_mavg
+    processed_df['bollinger_middle'] = bb.bollinger_mavg()
+    # Map to FEATURE_COLUMNS names if different
+    processed_df['bb_upper'] = processed_df['bollinger_upper']
+    processed_df['bb_middle'] = processed_df['bollinger_middle']
+    processed_df['bb_lower'] = processed_df['bollinger_lower']
+    # Calculate Bollinger Bands breakout (1 for upper breakout, -1 for lower breakout, 0 otherwise)
+    processed_df['bb_breakout'] = 0
+    processed_df.loc[processed_df['close'] > processed_df['bb_upper'], 'bb_breakout'] = 1
+    processed_df.loc[processed_df['close'] < processed_df['bb_lower'], 'bb_breakout'] = -1
     
     # VPVR features
-    vpvr_features = calculate_vpvr(processed_df)
+    vpvr_lookback = 500
+    window_data = processed_df.tail(vpvr_lookback)
+    vpvr_features = calculate_vpvr(window_data)
     for key, value in vpvr_features.items():
-        processed_df[key] = value
+        processed_df[key] = value.reindex(processed_df.index, method='ffill').fillna(0)
     
     # LuxAlgo signals
     processed_df['luxalgo_signal'] = generate_luxalgo_signals(processed_df)
@@ -173,13 +193,29 @@ def preprocess_data(data: pd.DataFrame) -> pd.DataFrame:
     # MetaStock trend slope
     processed_df['metastock_slope'] = generate_metastock_slope(processed_df)
     
+    # Additional features
+    halving_dates = [
+        pd.Timestamp("2012-11-28"),
+        pd.Timestamp("2016-07-09"),
+        pd.Timestamp("2020-05-11"),
+        pd.Timestamp("2024-04-19"),
+        pd.Timestamp("2028-03-15")
+    ]
+    processed_df['days_to_next_halving'] = [calculate_days_to_next_halving(idx, halving_dates)[0] for idx in processed_df.index]
+    processed_df['days_since_last_halving'] = [(idx - max([h for h in halving_dates if h <= idx])).days if any(h <= idx for h in halving_dates) else 0 for idx in processed_df.index]
+    processed_df['garch_volatility'] = processed_df['log_returns'].rolling(window=24).std().fillna(0)  # Simple proxy for GARCH
+    processed_df['volume_normalized'] = processed_df['volume'] / processed_df['volume'].rolling(window=20).mean().fillna(1.0)
+    processed_df['hour_of_day'] = processed_df.index.hour
+    processed_df['day_of_week'] = processed_df.index.dayofweek
+    processed_df['smrt_scalping_signal'] = smrt_scalping_signals(processed_df, atr_multiplier=1.0)
+
     # Handle missing values
     processed_df = processed_df.fillna(0)
     
     # Ensure all required columns are present
     for col in FEATURE_COLUMNS:
         if col not in processed_df.columns:
-            logger.warning(f"Feature column {col} not computed, adding with zeros")
+            logger.warning(f"Feature column {col} not computed, adding with zeros")  # [TODO] Investigate why this feature is missing
             processed_df[col] = 0
     
     logger.info(f"Preprocessed data shape: {processed_df.shape}")
@@ -208,5 +244,5 @@ def scale_features(data: pd.DataFrame, feature_columns: List[str]) -> pd.DataFra
                 scaled_df[col] = 0
             logger.info(f"Feature {col}: min={min_val:.4f}, max={max_val:.4f}, mean={scaled_df[col].mean():.4f}")
         else:
-            logger.warning(f"Feature {col} not found in DataFrame, skipping scaling")
+            logger.warning(f"Feature {col} not found in DataFrame, skipping scaling")  # [MODULAR NOTE] Check FEATURE_COLUMNS definition
     return scaled_df

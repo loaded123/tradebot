@@ -1,4 +1,3 @@
-# src/strategy/backtest_visualizer_ultimate.py
 import asyncio
 import sys
 import os
@@ -11,6 +10,7 @@ import numpy as np
 from matplotlib.dates import DateFormatter, DayLocator
 import json
 from datetime import datetime
+from itertools import product
 
 # Direct imports
 from src.strategy.signal_generator import generate_signals
@@ -21,7 +21,7 @@ from src.constants import FEATURE_COLUMNS
 from src.strategy.market_regime import detect_market_regime
 from src.strategy.risk_manager import manage_risk
 
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,7 +76,8 @@ async def plot_backtest_results(portfolio_value: pd.Series, signals: pd.DataFram
             logger.warning("Cannot calculate MAPE: 'predicted_price' not in signals")
 
         # Downsample data for plotting to avoid MAXTICKS exceeded
-        signals_ds = signals.resample('4h').mean().dropna()
+        numeric_columns = signals.select_dtypes(include=[np.number]).columns
+        signals_ds = signals[numeric_columns].resample('4h').mean().dropna()
         portfolio_value_ds = portfolio_value.resample('4h').mean().dropna()
         if not trades.empty:
             trades_ds = trades.resample('4h').mean().dropna()
@@ -202,16 +203,16 @@ async def plot_backtest_results(portfolio_value: pd.Series, signals: pd.DataFram
 def load_model() -> TransformerPredictor:
     """Load the trained TransformerPredictor model."""
     input_dim = len(FEATURE_COLUMNS)
-    d_model = 128
+    d_model = 512  # Match train_transformer_model.py
     n_heads = 8
-    n_layers = 4
-    dropout = 0.7
+    n_layers = 8   # Match train_transformer_model.py
+    dropout = 0.3  # Match train_transformer_model.py
     
     model = TransformerPredictor(input_dim=input_dim, d_model=d_model, n_heads=n_heads, n_layers=n_layers, dropout=dropout)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model_path = 'best_model.pth'
-    state_dict = torch.load(model_path, map_location=device)
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)  # Updated for FutureWarning
     model_dict = model.state_dict()
     state_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
     model.load_state_dict(state_dict, strict=False)
@@ -220,30 +221,29 @@ def load_model() -> TransformerPredictor:
     return model
 
 def filter_signals(signal_data: pd.DataFrame, min_hold_period: int = 6) -> pd.DataFrame:
-    """Filter signals to enforce a minimum hold period, using confidence."""
+    """Vectorized filter for signals to enforce a minimum hold period, using confidence."""
     signal_data.index = pd.to_datetime(signal_data.index, utc=True).tz_localize(None)
-    last_signal_time = None
-    signal_data['filtered_signal'] = signal_data['signal'].fillna(0)
-    for idx in signal_data.index:
-        current_signal = signal_data.loc[idx, 'signal']
-        confidence = signal_data.loc[idx, 'signal_confidence'] if 'signal_confidence' in signal_data.columns else 0.0
-        price_volatility = signal_data.loc[idx, 'price_volatility'] if 'price_volatility' in signal_data.columns else 0.0
-        dynamic_min_hold = min_hold_period if price_volatility <= signal_data['price_volatility'].mean() else 2
-        min_confidence = 0.15
-        
-        if (last_signal_time is None or (idx - last_signal_time).total_seconds() / 3600 >= dynamic_min_hold) and \
-           current_signal != 0 and confidence >= min_confidence:
-            last_signal_time = idx
-            logger.debug(f"Accepted signal at {idx} with confidence {confidence:.2f}")
-        else:
-            signal_data.loc[idx, 'filtered_signal'] = 0
-            if current_signal != 0:
-                logger.debug(f"Filtered signal at {idx}: Min hold ({dynamic_min_hold} hours), Confidence ({confidence:.2f} < {min_confidence})")
-
-    signal_data['signal'] = signal_data['filtered_signal']
-    signal_data.drop(columns=['filtered_signal'], inplace=True)
-    logger.info(f"Filtered signal data columns: {signal_data.columns.tolist()}")
-    return signal_data
+    filtered_df = signal_data.copy()
+    
+    # Since signal_generator.py already filters with min_confidence=0.25 and hold period,
+    # we can simplify this to additional market-specific filtering if needed.
+    # For now, let's apply a volatility-based filter to reduce signals in extreme conditions.
+    filtered_df['time_diff'] = filtered_df.index.to_series().diff().dt.total_seconds() / 3600
+    filtered_df['cum_time'] = filtered_df['time_diff'].cumsum().fillna(0)
+    filtered_df['dynamic_min_hold'] = np.where(filtered_df['price_volatility'] > filtered_df['price_volatility'].mean(), min_hold_period, 3)
+    
+    # Additional filtering: Avoid signals during extreme volatility
+    volatility_threshold = filtered_df['price_volatility'].quantile(0.95)  # Top 5% volatility
+    filtered_df['signal_valid'] = (filtered_df['cum_time'] >= filtered_df['dynamic_min_hold'].shift(1, fill_value=0)) & \
+                                 (filtered_df['signal'] != 0) & \
+                                 (filtered_df['price_volatility'] <= volatility_threshold)
+    
+    filtered_df['signal'] = np.where(filtered_df['signal_valid'], filtered_df['signal'], 0)
+    filtered_df.drop(columns=['time_diff', 'cum_time', 'dynamic_min_hold', 'signal_valid'], inplace=True)
+    
+    logger.info(f"Filtered signal data columns: {filtered_df.columns.tolist()}")
+    logger.info(f"Signals after additional filtering: Buy={(filtered_df['signal'] == 1).sum()}, Sell={(filtered_df['signal'] == -1).sum()}")
+    return filtered_df
 
 def backtest_strategy(signal_data: pd.DataFrame, preprocessed_data: pd.DataFrame, initial_capital: float = 10000) -> dict:
     """Backtest the trading strategy with precomputed trade levels and confidence-based filtering."""
@@ -290,7 +290,8 @@ def backtest_strategy(signal_data: pd.DataFrame, preprocessed_data: pd.DataFrame
         trailing_stop = signal_data.loc[idx, 'trailing_stop'] if 'trailing_stop' in signal_data.columns else np.nan
         confidence = signal_data.loc[idx, 'signal_confidence'] if 'signal_confidence' in signal_data.columns else 0.0
 
-        if signal_data.loc[idx, 'signal'] == 1 and position_size > 0 and pd.notna(take_profit) and pd.notna(stop_loss) and confidence >= 0.15:
+        # Use precomputed take_profit and stop_loss from signal_generator.py
+        if signal_data.loc[idx, 'signal'] == 1 and position_size > 0 and pd.notna(take_profit) and pd.notna(stop_loss) and confidence >= 0.25:
             open_positions[idx] = (position_size, current_price, stop_loss, take_profit, trailing_stop, False)
             trades.loc[idx, 'entry_price'] = current_price
             trade_history.append({
@@ -304,7 +305,7 @@ def backtest_strategy(signal_data: pd.DataFrame, preprocessed_data: pd.DataFrame
             })
             trade_count += 1
             logger.info(f"Trade Entry (Buy) at {idx}: {position_size:.6f} BTC, Price: {current_price:.2f} USD, Confidence: {confidence:.2f}")
-        elif signal_data.loc[idx, 'signal'] == -1 and position_size > 0 and pd.notna(take_profit) and pd.notna(stop_loss) and confidence >= 0.15:
+        elif signal_data.loc[idx, 'signal'] == -1 and position_size > 0 and pd.notna(take_profit) and pd.notna(stop_loss) and confidence >= 0.25:
             open_positions[idx] = (-position_size, current_price, stop_loss, take_profit, trailing_stop, False)
             trades.loc[idx, 'entry_price'] = current_price
             trade_history.append({
@@ -454,8 +455,85 @@ def backtest_strategy(signal_data: pd.DataFrame, preprocessed_data: pd.DataFrame
         }
     }
 
+async def optimize_weights(signal_data: pd.DataFrame, preprocessed_data: pd.DataFrame, initial_capital: float, weight_ranges: dict):
+    """
+    Optimize indicator weights using grid search to maximize Sharpe ratio.
+    
+    Args:
+        signal_data (pd.DataFrame): DataFrame with signals.
+        preprocessed_data (pd.DataFrame): Preprocessed market data.
+        initial_capital (float): Initial capital for backtesting.
+        weight_ranges (dict): Dictionary of weight ranges for each indicator.
+    
+    Returns:
+        tuple: Best weights and corresponding Sharpe ratio.
+    """
+    best_sharpe = -float('inf')
+    best_weights = None
+    
+    from src.constants import (WEIGHT_LUXALGO, WEIGHT_TRENDSPIDER, WEIGHT_SMRT_SCALPING,
+                              WEIGHT_METASTOCK, WEIGHT_MODEL_CONFIDENCE)
+    
+    for w_lux, w_trend, w_smrt, w_meta, w_model in product(
+        weight_ranges['luxalgo'], weight_ranges['trendspider'],
+        weight_ranges['smrt'], weight_ranges['metastock'], weight_ranges['model']
+    ):
+        # Temporarily update weights in constants
+        original_weights = {
+            'WEIGHT_LUXALGO': WEIGHT_LUXALGO,
+            'WEIGHT_TRENDSPIDER': WEIGHT_TRENDSPIDER,
+            'WEIGHT_SMRT_SCALPING': WEIGHT_SMRT_SCALPING,
+            'WEIGHT_METASTOCK': WEIGHT_METASTOCK,
+            'WEIGHT_MODEL_CONFIDENCE': WEIGHT_MODEL_CONFIDENCE
+        }
+        globals()['WEIGHT_LUXALGO'] = w_lux
+        globals()['WEIGHT_TRENDSPIDER'] = w_trend
+        globals()['WEIGHT_SMRT_SCALPING'] = w_smrt
+        globals()['WEIGHT_METASTOCK'] = w_meta
+        globals()['WEIGHT_MODEL_CONFIDENCE'] = w_model
+
+        # Regenerate signals with updated weights
+        signal_data_copy = signal_data.copy()
+        signal_data_copy = await generate_signals(
+            scaled_df=scale_features(preprocessed_data[FEATURE_COLUMNS]),
+            preprocessed_data=preprocessed_data,
+            model=load_model(),
+            train_columns=FEATURE_COLUMNS,
+            feature_scaler=joblib.load('feature_scaler.pkl'),
+            target_scaler=joblib.load('target_scaler.pkl'),
+            rsi_threshold=30,
+            macd_fast=12,
+            macd_slow=26,
+            atr_multiplier=1.0,
+            max_risk_pct=0.10
+        )
+        signal_data_copy = filter_signals(signal_data_copy)
+
+        # Run backtest
+        results = backtest_strategy(signal_data_copy, preprocessed_data, initial_capital)
+        sharpe = results['metrics']['sharpe_ratio']
+
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_weights = (w_lux, w_trend, w_smrt, w_meta, w_model)
+
+        # Restore original weights
+        globals()['WEIGHT_LUXALGO'] = original_weights['WEIGHT_LUXALGO']
+        globals()['WEIGHT_TRENDSPIDER'] = original_weights['WEIGHT_TRENDSPIDER']
+        globals()['WEIGHT_SMRT_SCALPING'] = original_weights['WEIGHT_SMRT_SCALPING']
+        globals()['WEIGHT_METASTOCK'] = original_weights['WEIGHT_METASTOCK']
+        globals()['WEIGHT_MODEL_CONFIDENCE'] = original_weights['WEIGHT_MODEL_CONFIDENCE']
+
+        logger.info(f"Tested weights: LuxAlgo={w_lux:.2f}, TrendSpider={w_trend:.2f}, SMRT={w_smrt:.2f}, "
+                    f"Metastock={w_meta:.2f}, Model={w_model:.2f}, Sharpe={sharpe:.2f}")
+
+    logger.info(f"Best weights found: LuxAlgo={best_weights[0]:.2f}, TrendSpider={best_weights[1]:.2f}, "
+                f"SMRT={best_weights[2]:.2f}, Metastock={best_weights[3]:.2f}, Model={best_weights[4]:.2f}, "
+                f"Best Sharpe={best_sharpe:.2f}")
+    return best_weights, best_sharpe
+
 async def main():
-    """Main function to run the backtest and visualization pipeline."""
+    """Main function to run the backtest and visualization pipeline with weight optimization."""
     logger.debug("Starting main()")
     symbol = 'BTC/USD'
     csv_path = r"C:\Users\Dennis\.vscode\tradebot\src\data\btc_usd_historical.csv"
@@ -479,14 +557,25 @@ async def main():
         logger.info(f"Preprocessed data shape: {preprocessed_data.shape}")
         logger.info(f"Preprocessed columns: {preprocessed_data.columns.tolist()}")
 
-        # Add and scale the target column
-        preprocessed_data['target'] = preprocessed_data['log_returns']
-        scaled_df = scale_features(preprocessed_data, FEATURE_COLUMNS + ['target'])
+        # Add log returns for target, matching train_transformer_model.py
+        preprocessed_data['returns'] = preprocessed_data['close'].pct_change().fillna(0)
+        preprocessed_data['log_returns'] = np.log1p(preprocessed_data['returns']).clip(lower=-0.1, upper=0.1)
+        preprocessed_data['target'] = preprocessed_data['log_returns'].shift(-1).fillna(0)
+        logger.info(f"Added target column (log_returns shifted): min={preprocessed_data['target'].min():.2f}, max={preprocessed_data['target'].max():.2f}")
+
+        # Scale features
+        feature_scaler = joblib.load('feature_scaler.pkl')
+        target_scaler = joblib.load('target_scaler.pkl')
+        scaled_features = feature_scaler.transform(preprocessed_data[FEATURE_COLUMNS])
+        scaled_target = target_scaler.transform(preprocessed_data[['target']])
+        scaled_df = pd.DataFrame(
+            np.hstack([scaled_features, scaled_target]),
+            columns=FEATURE_COLUMNS + ['target'],
+            index=preprocessed_data.index
+        )
         logger.info(f"Scaled data shape: {scaled_df.shape}")
         logger.info(f"Scaled columns: {scaled_df.columns.tolist()}")
 
-        feature_scaler = joblib.load('feature_scaler.pkl')
-        target_scaler = joblib.load('target_scaler.pkl')
         train_columns = FEATURE_COLUMNS
 
         model = load_model()
@@ -502,15 +591,16 @@ async def main():
             'Neutral': {'rsi_threshold': 30, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2.0, 'max_risk_pct': 0.08}
         }
         params = regime_params.get(regime, {'rsi_threshold': 30, 'macd_fast': 12, 'macd_slow': 26, 'atr_multiplier': 2.0, 'max_risk_pct': 0.10})
+        logger.info(f"Using regime parameters: {params}")
 
         logger.info("Entering generate_signals function")
         signal_data = await generate_signals(
-            scaled_df,
-            preprocessed_data,
-            model,
-            train_columns,
-            feature_scaler,
-            target_scaler,
+            scaled_df=scaled_df,
+            preprocessed_data=preprocessed_data,
+            model=model,
+            train_columns=train_columns,
+            feature_scaler=feature_scaler,
+            target_scaler=target_scaler,
             rsi_threshold=params['rsi_threshold'],
             macd_fast=params['macd_fast'],
             macd_slow=params['macd_slow'],
@@ -521,23 +611,63 @@ async def main():
             raise ValueError("No signals generated or 'close' missing from signal_data")
         logger.info(f"Signal data columns before filtering: {signal_data.columns.tolist()}")
         logger.info(f"Signal data index: {signal_data.index[:5]}, last: {signal_data.index[-5:]}")
+        logger.info(f"Signals generated: Buy={(signal_data['signal'] == 1).sum()}, Sell={(signal_data['signal'] == -1).sum()}")
 
-        signal_data = filter_signals(signal_data, min_hold_period=6)
+        signal_data = filter_signals(signal_data)
 
         current_balance = 17396.68
-        signal_data, current_balance = manage_risk(signal_data, current_balance, max_drawdown_pct=0.10,
-                                                  atr_multiplier=params['atr_multiplier'],
-                                                  recovery_volatility_factor=0.15,
-                                                  max_risk_pct=params['max_risk_pct'],
-                                                  min_position_size=0.002)
+        signal_data, current_balance = manage_risk(
+            signal_data=signal_data,
+            current_balance=current_balance,
+            max_drawdown_pct=0.10,
+            atr_multiplier=params['atr_multiplier'],
+            recovery_volatility_factor=0.15,
+            max_risk_pct=params['max_risk_pct'],
+            min_position_size=0.002
+        )
+        logger.info(f"Balance after risk management: {current_balance:.2f}")
 
         logger.info(f"Signal data columns before backtest: {signal_data.columns.tolist()}")
         logger.info(f"Signal data index before backtest: {signal_data.index[:5]}, last: {signal_data.index[-5:]}")
+
+        # Define weight ranges for optimization
+        weight_ranges = {
+            'luxalgo': [0.1, 0.2, 0.3, 0.4, 0.5],
+            'trendspider': [0.1, 0.2, 0.3],
+            'smrt': [0.1, 0.2, 0.3],
+            'metastock': [0.1, 0.2, 0.3],
+            'model': [0.2, 0.3, 0.4, 0.5]
+        }
+        best_weights, best_sharpe = await optimize_weights(signal_data, preprocessed_data, current_balance, weight_ranges)
+
+        # Update constants with best weights
+        from src.constants import (WEIGHT_LUXALGO, WEIGHT_TRENDSPIDER, WEIGHT_SMRT_SCALPING,
+                                 WEIGHT_METASTOCK, WEIGHT_MODEL_CONFIDENCE)
+        globals()['WEIGHT_LUXALGO'], globals()['WEIGHT_TRENDSPIDER'], globals()['WEIGHT_SMRT_SCALPING'], globals()['WEIGHT_METASTOCK'], globals()['WEIGHT_MODEL_CONFIDENCE'] = best_weights
+        logger.info(f"Updated weights: LuxAlgo={WEIGHT_LUXALGO:.2f}, TrendSpider={WEIGHT_TRENDSPIDER:.2f}, "
+                    f"SMRT={WEIGHT_SMRT_SCALPING:.2f}, Metastock={WEIGHT_METASTOCK:.2f}, Model={WEIGHT_MODEL_CONFIDENCE:.2f}")
+
+        # Regenerate signals with optimized weights
+        signal_data = await generate_signals(
+            scaled_df=scaled_df,
+            preprocessed_data=preprocessed_data,
+            model=model,
+            train_columns=train_columns,
+            feature_scaler=feature_scaler,
+            target_scaler=target_scaler,
+            rsi_threshold=params['rsi_threshold'],
+            macd_fast=params['macd_fast'],
+            macd_slow=params['macd_slow'],
+            atr_multiplier=params['atr_multiplier'],
+            max_risk_pct=params['max_risk_pct']
+        )
+        signal_data = filter_signals(signal_data)
+
         results = backtest_strategy(signal_data, preprocessed_data, initial_capital=current_balance)
         await plot_backtest_results(results['total'], signal_data, results['trades'], symbol)
 
     except Exception as e:
-        logger.error(f"Error in backtest: {e}")
+        logger.error(f"Error in backtest: {e}", exc_info=True)
         raise
 
 if __name__ == "__main__":

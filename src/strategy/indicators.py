@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message
 
 # Configure separate logger for VPVR
 vpvr_logger = logging.getLogger('vpvr')
-vpvr_logger.setLevel(logging.DEBUG)  # Change to DEBUG to reduce verbosity
+vpvr_logger.setLevel(logging.DEBUG)  # Change to INFO if you don't need debug output
 vpvr_handler = logging.FileHandler('vpvr.log')
 vpvr_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s'))
 vpvr_logger.addHandler(vpvr_handler)
@@ -68,6 +68,32 @@ def compute_bollinger_bands(df: pd.DataFrame, period: int = 20, std_dev: float =
             return pd.DataFrame({'bb_upper': [], 'bb_middle': [], 'bb_lower': [], 'bb_breakout': []}, index=df.index)
 
         bbands = ta.bbands(df['close'], length=period, std=std_dev)
+        # Expected columns without the '.0' suffix
+        expected_columns = [f'BBU_{period}_{std_dev}', f'BBM_{period}_{std_dev}', f'BBL_{period}_{std_dev}']
+        
+        # Check available columns and rename if necessary
+        available_columns = bbands.columns.tolist()
+        logging.debug(f"Computed Bollinger Bands columns before renaming: {available_columns}")
+        
+        # Rename columns to remove '.0' suffix if present
+        rename_dict = {}
+        for col in available_columns:
+            if col.endswith(f'_{std_dev}.0'):
+                base_name = col.rsplit('.', 1)[0]  # Remove '.0' suffix
+                rename_dict[col] = base_name
+        
+        if rename_dict:
+            bbands = bbands.rename(columns=rename_dict)
+            logging.info(f"Renamed Bollinger Bands columns: {rename_dict}")
+        
+        # Verify and select expected columns
+        available_columns = bbands.columns.tolist()
+        for expected_col in expected_columns:
+            if expected_col not in available_columns:
+                logging.warning(f"Column {expected_col} not found after renaming. Filling with default values.")
+                default_value = df['close'].mean() if 'close' in df.columns else 78877.88
+                bbands[expected_col] = default_value
+
         result = pd.DataFrame(index=df.index)
         result['bb_upper'] = bbands[f'BBU_{period}_{std_dev}']
         result['bb_middle'] = bbands[f'BBM_{period}_{std_dev}']
@@ -209,11 +235,9 @@ def calculate_vpvr(df: pd.DataFrame, lookback: int = 500, num_bins: int = 50) ->
                     'lvn_lower': df['close'].iloc[-1] if not df.empty else 0}
 
         price_range = df_subset['close'].max() - df_subset['close'].min()
-        logging.debug(f"VPVR price range: {df_subset['close'].min():.2f} to {df_subset['close'].max():.2f}, range={price_range:.2f}")
 
         # Use fixed num_bins=50 to match other scripts, overriding dynamic adjustment
         adjusted_num_bins = num_bins
-        logging.debug(f"Using fixed number of bins: {adjusted_num_bins}")
 
         # Ensure sufficient unique prices for binning
         unique_prices = df_subset['close'].dropna().nunique()
