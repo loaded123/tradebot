@@ -4,3 +4,4 @@ scripts/*
 share/*
 .venv/*
 .pytest_cache/*
+best_model*
