@@ -134,4 +134,4 @@ License
 This project is licensed under the MIT License. See the LICENSE file for details.
 
 Contact
-For questions or support, contact [your email] or open an issue on GitHub.
+For questions or support, contact dromback@gmail.com or open an issue on GitHub.

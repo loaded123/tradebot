@@ -5,7 +5,8 @@ import ccxt.async_support as ccxt
 import logging
 import os
 from datetime import datetime
-import csv
+import pytz
+from src.constants import DEFAULT_OPEN, DEFAULT_CLOSE, DEFAULT_HIGH, DEFAULT_LOW, DEFAULT_VOLUME
 
 # Configure logging
 script_dir = os.path.abspath(os.path.dirname(__file__))
@@ -23,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('data_fetcher')
 
-async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_name='bitfinex', csv_path=None):
+async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_name='bitfinex', csv_path=None, min_volume_threshold=1.0):
     """
     Fetch historical OHLCV data asynchronously from a specified exchange or load from a CSV file.
     
@@ -33,11 +34,12 @@ async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_nam
         limit (int): Maximum number of data points to fetch per request
         exchange_name (str): Name of the exchange (e.g., 'bitfinex', 'gemini')
         csv_path (str, optional): Path to a local CSV file with OHLCV data
+        min_volume_threshold (float): Minimum volume threshold to filter low-volume periods (default: 1.0)
     
     Returns:
-        pd.DataFrame: OHLCV data with unscaled prices
+        pd.DataFrame: OHLCV data with unscaled prices, continuous timestamps, and filtered low-volume periods
     """
-    current_date = datetime.utcnow().replace(hour=23, minute=0, second=0, microsecond=0)
+    current_date = datetime.now(pytz.UTC).replace(hour=23, minute=0, second=0, microsecond=0)  # Ensure UTC timezone
 
     # Prioritize CSV if provided and exists
     if csv_path and os.path.exists(csv_path):
@@ -60,16 +62,39 @@ async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_nam
             if df['timestamp'].isna().all():
                 raise ValueError("Unable to parse timestamp column in CSV")
             df = df.dropna(subset=['timestamp'])
-            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+
+            # Check for duplicate timestamps
+            if df['timestamp'].duplicated().any():
+                logger.warning(f"Found {df['timestamp'].duplicated().sum()} duplicate timestamps. Removing duplicates.")
+                df = df.drop_duplicates(subset=['timestamp'], keep='first')
+
             df = df.set_index('timestamp')
-            full_range = pd.date_range(start=df.index.min(), end=current_date, freq='h')
-            df = df.reindex(full_range)
-            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].ffill()
-            df['open'] = df['open'].fillna(df['open'].mean() if not df['open'].isna().all() else 78877.88)
-            df['high'] = df['high'].fillna(df['high'].mean() if not df['high'].isna().all() else 79367.5)
-            df['low'] = df['low'].fillna(df['low'].mean() if not df['low'].isna().all() else 78186.98)
-            df['close'] = df['close'].fillna(df['close'].mean() if not df['close'].isna().all() else 78877.88)
-            df['volume'] = df['volume'].fillna(df['volume'].mean() if not df['volume'].isna().all() else 1000.0)
+            # Ensure the index is timezone-aware (UTC)
+            if df.index.tz is None:
+                logger.warning("Index timezone is None, localizing to UTC")
+                df.index = df.index.tz_localize('UTC')
+            elif df.index.tz != pytz.UTC:
+                logger.warning(f"Index timezone {df.index.tz} differs from UTC, converting to UTC")
+                df.index = df.index.tz_convert('UTC')
+
+            # Ensure continuous timestamps
+            full_range = pd.date_range(start=df.index.min(), end=current_date, freq='h', tz='UTC')
+            if len(full_range) != len(df):
+                logger.warning(f"Timestamps are not continuous. Expected {len(full_range)} timestamps, got {len(df)}. Reindexing.")
+                df = df.reindex(full_range)
+                df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].ffill()
+                df['open'] = df['open'].fillna(df['open'].mean() if not df['open'].isna().all() else DEFAULT_OPEN)
+                df['high'] = df['high'].fillna(df['high'].mean() if not df['high'].isna().all() else DEFAULT_HIGH)
+                df['low'] = df['low'].fillna(df['low'].mean() if not df['low'].isna().all() else DEFAULT_LOW)
+                df['close'] = df['close'].fillna(df['close'].mean() if not df['close'].isna().all() else DEFAULT_CLOSE)
+                df['volume'] = df['volume'].fillna(df['volume'].mean() if not df['volume'].isna().all() else DEFAULT_VOLUME)
+
+            # Filter low-volume periods
+            low_volume_mask = df['volume'] < min_volume_threshold
+            if low_volume_mask.any():
+                logger.warning(f"Found {low_volume_mask.sum()} periods with volume below {min_volume_threshold}. Imputing volume.")
+                df.loc[low_volume_mask, 'volume'] = df['volume'].rolling(window=24, min_periods=1).mean()[low_volume_mask]
+
             logger.info(f"Loaded {len(df)} rows from CSV file")
             return df
         except Exception as e:
@@ -163,17 +188,31 @@ async def fetch_historical_data(symbol, timeframe='1h', limit=3000, exchange_nam
             df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True, errors='coerce')
             df = df.dropna(subset=['timestamp'])
-            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
-            df = df.set_index('timestamp')
 
-            full_range = pd.date_range(start=pd.to_datetime(start_timestamp, unit='ms'), end=current_date, freq='h')
-            df = df.reindex(full_range)
-            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].ffill()
-            df['open'] = df['open'].fillna(df['open'].mean() if not df['open'].isna().all() else 78877.88)
-            df['high'] = df['high'].fillna(df['high'].mean() if not df['high'].isna().all() else 79367.5)
-            df['low'] = df['low'].fillna(df['low'].mean() if not df['low'].isna().all() else 78186.98)
-            df['close'] = df['close'].fillna(df['close'].mean() if not df['close'].isna().all() else 78877.88)
-            df['volume'] = df['volume'].fillna(df['volume'].mean() if not df['volume'].isna().all() else 1000.0)
+            # Check for duplicate timestamps
+            if df['timestamp'].duplicated().any():
+                logger.warning(f"Found {df['timestamp'].duplicated().sum()} duplicate timestamps. Removing duplicates.")
+                df = df.drop_duplicates(subset=['timestamp'], keep='first')
+
+            df = df.set_index('timestamp')
+            # Ensure continuous timestamps
+            full_range = pd.date_range(start=pd.to_datetime(start_timestamp, unit='ms', utc=True), end=current_date, freq='h', tz='UTC')
+            if len(full_range) != len(df):
+                logger.warning(f"Timestamps are not continuous. Expected {len(full_range)} timestamps, got {len(df)}. Reindexing.")
+                df = df.reindex(full_range)
+                df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].ffill()
+                df['open'] = df['open'].fillna(df['open'].mean() if not df['open'].isna().all() else DEFAULT_OPEN)
+                df['high'] = df['high'].fillna(df['high'].mean() if not df['high'].isna().all() else DEFAULT_HIGH)
+                df['low'] = df['low'].fillna(df['low'].mean() if not df['low'].isna().all() else DEFAULT_LOW)
+                df['close'] = df['close'].fillna(df['close'].mean() if not df['close'].isna().all() else DEFAULT_CLOSE)
+                df['volume'] = df['volume'].fillna(df['volume'].mean() if not df['volume'].isna().all() else DEFAULT_VOLUME)
+
+            # Filter low-volume periods
+            low_volume_mask = df['volume'] < min_volume_threshold
+            if low_volume_mask.any():
+                logger.warning(f"Found {low_volume_mask.sum()} periods with volume below {min_volume_threshold}. Imputing volume.")
+                df.loc[low_volume_mask, 'volume'] = df['volume'].rolling(window=24, min_periods=1).mean()[low_volume_mask]
+
             logger.info(f"Fetched {len(df)} rows from {current_exchange} for {adjusted_symbol}")
             return df
 
@@ -209,7 +248,7 @@ async def fetch_real_time_ws(symbol, exchange_name='bitfinex'):
         while True:
             # Dummy data as a placeholder
             data = {
-                'timestamp': pd.Timestamp.now(),
+                'timestamp': pd.Timestamp.now(tz='UTC'),
                 'price': 12345.67  # Replace with actual WebSocket data
             }
             logger.debug(f"Yielding real-time data: {data}")

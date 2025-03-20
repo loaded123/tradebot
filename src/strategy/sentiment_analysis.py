@@ -1,26 +1,53 @@
 # src/strategy/sentiment_analysis.py
+"""
+This module simulates sentiment analysis for the trading bot, estimating market sentiment based on
+price trends, technical indicators, and volatility. It provides simulated X sentiment, historical sentiment,
+Fear and Greed Index, and whale move indicators.
+
+Key Integrations:
+- **src.data.data_preprocessor**: Uses preprocessed data with features like 'close', 'momentum_rsi',
+  'trend_macd', and 'volume' to compute sentiment scores.
+- **src.strategy.signal_generator**: Can integrate sentiment scores to adjust signal confidence or weights.
+- **src.strategy.backtest_visualizer_ultimate**: Provides preprocessed data for sentiment analysis during backtesting.
+
+Future Considerations:
+- Replace simulated X sentiment with actual API data when available (e.g., using X API for tweet sentiment).
+- Incorporate more advanced sentiment analysis (e.g., NLP on news articles or social media).
+- Add support for real-time sentiment updates in live trading scenarios.
+
+Dependencies:
+- pandas
+- numpy
+- typing.Dict
+"""
+
 import logging
 import numpy as np
 import pandas as pd
 from typing import Dict
 
-# Configure logging for this module
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s:%(name)s:%(message)s')
+# Configure logging
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 async def fetch_x_sentiment(preprocessed_data: pd.DataFrame, idx: pd.Timestamp, suppress_logs: bool = False) -> float:
     """
     Simulate X sentiment based on price trend, RSI, volume change, and Fear & Greed Index.
 
     Args:
-        preprocessed_data (pd.DataFrame): Preprocessed market data.
+        preprocessed_data (pd.DataFrame): Preprocessed market data with columns like 'close', 'momentum_rsi', 'volume'.
         idx (pd.Timestamp): Timestamp for sentiment calculation.
-        suppress_logs (bool): If True, suppress logging of sentiment simulation details.
+        suppress_logs (bool): If True, suppress logging of sentiment simulation details (default: False).
 
     Returns:
         float: Simulated sentiment score between -1.0 and 1.0.
+
+    Notes:
+        - Combines price change, RSI, volume change, and a simulated Fear & Greed Index to estimate sentiment.
+        - Clips the final sentiment score to ensure it stays within the valid range.
     """
     if not suppress_logs:
-        logging.warning(f"Simulating X sentiment at {idx}. Free X API tier does not support tweet search.")
+        logger.warning(f"Simulating X sentiment at {idx}. Free X API tier does not support tweet search.")
 
     window = 24
     historical_data = preprocessed_data.loc[:idx].tail(window) if len(preprocessed_data.loc[:idx]) >= window else preprocessed_data.loc[:idx]
@@ -55,7 +82,7 @@ async def fetch_x_sentiment(preprocessed_data: pd.DataFrame, idx: pd.Timestamp, 
     sentiment = np.clip(sentiment, -1.0, 1.0)
 
     if not suppress_logs:
-        logging.info(f"Simulated X sentiment at {idx}: {sentiment:.2f}")
+        logger.info(f"Simulated X sentiment at {idx}: {sentiment:.2f}")
 
     return sentiment
 
@@ -64,11 +91,15 @@ def calculate_historical_sentiment(preprocessed_data: pd.DataFrame, idx: pd.Time
     Estimate historical sentiment based on RSI, MACD, and price trend.
 
     Args:
-        preprocessed_data (pd.DataFrame): Preprocessed market data.
+        preprocessed_data (pd.DataFrame): Preprocessed market data with columns like 'close', 'momentum_rsi', 'trend_macd'.
         idx (pd.Timestamp): Timestamp for sentiment calculation.
 
     Returns:
         float: Sentiment score between -1.0 and 1.0.
+
+    Notes:
+        - Combines price change, RSI, and MACD to estimate historical market sentiment.
+        - Clips the final sentiment score to ensure it stays within the valid range.
     """
     window = 24
     historical_data = preprocessed_data.loc[:idx].tail(window) if len(preprocessed_data.loc[:idx]) >= window else preprocessed_data.loc[:idx]
@@ -94,11 +125,15 @@ async def get_fear_and_greed_index(preprocessed_data: pd.DataFrame, idx: pd.Time
     Simulate Fear and Greed Index based on price volatility.
 
     Args:
-        preprocessed_data (pd.DataFrame): Preprocessed market data.
+        preprocessed_data (pd.DataFrame): Preprocessed market data with 'close' column.
         idx (pd.Timestamp): Timestamp for calculation.
 
     Returns:
         float: Simulated Fear and Greed Index (0 to 100).
+
+    Notes:
+        - Estimates the Fear and Greed Index using price volatility over a 24-period window.
+        - Clips the result to ensure it stays within the valid range.
     """
     window = 24
     historical_data = preprocessed_data.loc[:idx].tail(window) if len(preprocessed_data.loc[:idx]) >= window else preprocessed_data.loc[:idx]
@@ -116,11 +151,15 @@ def simulate_historical_whale_moves(preprocessed_data: pd.DataFrame, idx: pd.Tim
     Simulate historical whale moves based on price volatility.
 
     Args:
-        preprocessed_data (pd.DataFrame): Preprocessed market data.
+        preprocessed_data (pd.DataFrame): Preprocessed market data with 'close' column.
         idx (pd.Timestamp): Timestamp for calculation.
 
     Returns:
         float: Simulated whale moves score (0 to 1).
+
+    Notes:
+        - Estimates whale activity using price volatility over a 24-period window.
+        - Clips the result to ensure it stays within the valid range.
     """
     window = 24
     historical_data = preprocessed_data.loc[:idx].tail(window) if len(preprocessed_data.loc[:idx]) >= window else preprocessed_data.loc[:idx]

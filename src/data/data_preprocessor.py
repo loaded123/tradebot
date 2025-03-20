@@ -1,241 +1,255 @@
 # src/data/data_preprocessor.py
+"""
+This module preprocesses raw market data by computing technical indicators, market regime,
+volatility clustering, and normalized features for training and backtesting.
+
+Key Integrations:
+- **src.data.data_fetcher.fetch_historical_data**: Provides raw OHLCV data.
+- **src.strategy.signal_filter.smrt_scalping_signals**: Generates SMRT scalping signals.
+- **src.utils.time_utils**: Adds halving-related features.
+- **src.constants.FEATURE_COLUMNS**: Defines the feature set to compute.
+- **src.models.train_transformer_model**: Uses preprocessed data for training.
+- **src.strategy.signal_generator**: Uses scaled features for signal generation.
+
+Future Considerations:
+- Optimize GARCH computation for large datasets.
+- Add multi-timeframe features (e.g., 4h, daily).
+- Implement feature selection to reduce dimensionality.
+
+Dependencies:
+- pandas
+- pandas-ta
+- numpy
+- arch (for GARCH)
+- src.strategy.signal_filter
+- src.utils.time_utils
+- src.constants
+- src.strategy.indicators
+"""
+
 import pandas as pd
+import pandas_ta as ta
 import numpy as np
 import logging
-from typing import List, Dict
-import ta  # Technical Analysis library
-from src.utils.time_utils import calculate_days_to_next_halving
-from src.constants import FEATURE_COLUMNS
+from typing import List
 from src.strategy.signal_filter import smrt_scalping_signals
+from src.utils.time_utils import calculate_days_to_next_halving, calculate_days_since_last_halving
+from src.constants import FEATURE_COLUMNS, USE_SMRT_SCALPING
+from src.strategy.indicators import (
+    calculate_atr, compute_vwap, compute_adx, calculate_rsi, calculate_macd,
+    compute_bollinger_bands, calculate_vpvr, calculate_stochastic_oscillator,
+    calculate_fibonacci_levels
+)
 
-logger = logging.getLogger(__name__)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logger = logging.getLogger('src.data.data_preprocessor')
 
-def calculate_vpvr(data: pd.DataFrame, price_col: str = 'close', volume_col: str = 'volume', num_bins: int = 100) -> Dict[str, pd.Series]:
-    """Calculate Volume Profile Visible Range (VPVR) and distances to key levels."""
-    prices = data[price_col]
-    volumes = data[volume_col]
-    
-    # Create price bins
-    price_range = prices.max() - prices.min()
-    bin_size = price_range / num_bins
-    bins = np.arange(prices.min(), prices.max() + bin_size, bin_size)
-    
-    # Calculate histogram of volume at each price level
-    hist, bin_edges = np.histogram(prices, bins=bins, weights=volumes)
-    
-    # Find Point of Control (POC) - price with highest volume
-    poc_idx = np.argmax(hist)
-    poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2
-    
-    # Find High Volume Nodes (HVN) and Low Volume Nodes (LVN)
-    volume_threshold = np.percentile(hist, 75)  # Top 25% of volume for HVN
-    hvn_mask = hist > volume_threshold
-    lvn_mask = hist < np.percentile(hist, 25)  # Bottom 25% for LVN
-    
-    hvn_prices = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in range(len(hvn_mask)) if hvn_mask[i]]
-    lvn_prices = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in range(len(lvn_mask)) if lvn_mask[i]]
-    
-    hvn_upper = max(hvn_prices) if hvn_prices else poc_price
-    hvn_lower = min(hvn_prices) if hvn_prices else poc_price
-    lvn_upper = max(lvn_prices) if lvn_prices else poc_price
-    lvn_lower = min(lvn_prices) if lvn_prices else poc_price
-    
-    # Calculate distances
-    dist_to_poc = prices - poc_price
-    dist_to_hvn_upper = prices - hvn_upper
-    dist_to_hvn_lower = prices - hvn_lower
-    dist_to_lvn_upper = prices - lvn_upper
-    dist_to_lvn_lower = prices - lvn_lower
-    
-    return {
-        'dist_to_poc': dist_to_poc,
-        'dist_to_hvn_upper': dist_to_hvn_upper,
-        'dist_to_hvn_lower': dist_to_hvn_lower,
-        'dist_to_lvn_upper': dist_to_lvn_upper,
-        'dist_to_lvn_lower': dist_to_lvn_lower
-    }
+def compute_supertrend(df: pd.DataFrame, length: int = 7, multiplier: float = 2.0) -> pd.Series:
+    """
+    Compute SuperTrend indicator with optimized parameters.
+    """
+    try:
+        supertrend = ta.supertrend(df['high'], df['low'], df['close'], length=length, multiplier=multiplier)
+        signal = supertrend[f'SUPERTd_{length}_{multiplier}']
+        signal = signal.fillna(0).astype(int)
+        return signal.rename('luxalgo_signal')
+    except Exception as e:
+        logger.error(f"Error computing SuperTrend: {e}")
+        return pd.Series(0, index=df.index, name='luxalgo_signal')
 
-def generate_luxalgo_signals(data: pd.DataFrame, trend_threshold: float = 0.01, reversal_threshold: float = 0.005) -> pd.Series:
-    """Generate mock LuxAlgo trend/reversal signals based on price movements."""
-    signals = pd.Series(0, index=data.index, dtype=int)
-    returns = data['close'].pct_change()
-    
-    # Trend signals
-    signals[returns > trend_threshold] = 1  # Uptrend
-    signals[returns < -trend_threshold] = -1  # Downtrend
-    
-    # Reversal signals (mocked based on RSI overbought/oversold)
-    rsi = ta.momentum.RSIIndicator(data['close']).rsi()
-    signals[(rsi > 70) & (returns < -reversal_threshold)] = -1  # Potential reversal down
-    signals[(rsi < 30) & (returns > reversal_threshold)] = 1   # Potential reversal up
-    
-    return signals
+def compute_ichimoku_signals(df: pd.DataFrame, tenkan: int = 9, kijun: int = 26, senkou: int = 52) -> pd.Series:
+    """
+    Compute Ichimoku Cloud signals with optimized parameters.
+    """
+    try:
+        ichimoku = ta.ichimoku(df['high'], df['low'], df['close'], tenkan=tenkan, kijun=kijun, senkou=senkou)[0]
+        signal = pd.Series(0, index=df.index, name='trendspider_signal')
+        signal[df['close'] > ichimoku['ISA_9']] = 1  # Bullish
+        signal[df['close'] < ichimoku['ISB_26']] = -1  # Bearish
+        return signal
+    except Exception as e:
+        logger.error(f"Error computing Ichimoku signals: {e}")
+        return pd.Series(0, index=df.index, name='trendspider_signal')
 
-def generate_trendspider_signals(data: pd.DataFrame, pattern_window: int = 10) -> pd.Series:
-    """Generate mock TrendSpider pattern signals based on candlestick patterns."""
-    signals = pd.Series(0, index=data.index, dtype=int)
-    returns = data['close'].pct_change()
-    
-    # Mock pattern detection (e.g., higher highs/higher lows for bullish, lower highs/lower lows for bearish)
-    rolling_high = data['high'].rolling(window=pattern_window).max()
-    rolling_low = data['low'].rolling(window=pattern_window).min()
-    signals[(rolling_high > rolling_high.shift(1)) & (rolling_low > rolling_low.shift(1))] = 1  # Bullish pattern
-    signals[(rolling_high < rolling_high.shift(1)) & (rolling_low < rolling_low.shift(1))] = -1  # Bearish pattern
-    
-    return signals
+def compute_ema_slope(df: pd.DataFrame, ema_period: int = 20, slope_window: int = 5) -> pd.DataFrame:
+    """
+    Compute EMA slope with optimized parameters and normalization.
+    """
+    try:
+        ema = df['close'].ewm(span=ema_period, adjust=False).mean()
+        slope = pd.Series(index=df.index, dtype=float)
+        for i in range(len(df)):
+            start_idx = max(0, i - slope_window + 1)
+            window = ema.iloc[start_idx:i+1]
+            if len(window) >= 2:
+                x = np.arange(len(window))
+                y = window.values
+                slope.iloc[i] = np.polyfit(x, y, 1)[0]
+            else:
+                slope.iloc[i] = 0.0
+        slope_normalized = slope / df['close']
+        return pd.DataFrame({
+            'metastock_slope': slope,
+            'metastock_slope_normalized': slope_normalized
+        }, index=df.index)
+    except Exception as e:
+        logger.error(f"Error computing EMA slope: {e}")
+        return pd.DataFrame({
+            'metastock_slope': [0.0] * len(df),
+            'metastock_slope_normalized': [0.0] * len(df)
+        }, index=df.index)
 
-def generate_metastock_slope(data: pd.DataFrame, window: int = 20) -> pd.Series:
-    """Generate MetaStock trend slope using a linear regression slope over a window."""
-    def linreg_slope(series):
-        x = np.arange(len(series))
-        slope, _ = np.polyfit(x, series, 1)
-        return slope
-    
-    return data['close'].rolling(window=window).apply(linreg_slope, raw=True).fillna(0)
+def compute_garch_volatility(returns: pd.Series, window: int = 24) -> pd.Series:
+    """
+    Compute GARCH(1,1) volatility (replaced with EWMA for performance).
+    """
+    try:
+        ewma_vol = returns.ewm(span=window, adjust=False).std()
+        return ewma_vol.fillna(0.0).rename('garch_volatility')
+    except Exception as e:
+        logger.error(f"Error computing GARCH volatility: {e}")
+        return pd.Series(0.0, index=returns.index, name='garch_volatility')
 
 def preprocess_data(data: pd.DataFrame) -> pd.DataFrame:
     """
-    Preprocess raw market data for model input, including technical indicators and new signals.
-    
-    Args:
-        data (pd.DataFrame): Raw market data with columns ['open', 'high', 'low', 'close', 'volume']
-    
-    Returns:
-        pd.DataFrame: Preprocessed DataFrame with all required features
+    Preprocess raw market data by computing features and signals.
     """
     logger.info("Starting data preprocessing...")
     
-    if not all(col in data.columns for col in ['open', 'high', 'low', 'close', 'volume']):
-        missing = [col for col in ['open', 'high', 'low', 'close', 'volume'] if col not in data.columns]
+    # Check for required columns (excluding timestamp since it's the index)
+    required_columns = ['open', 'high', 'low', 'close', 'volume']
+    if not all(col in data.columns for col in required_columns):
+        missing = [col for col in required_columns if col not in data.columns]
         raise ValueError(f"Missing required columns: {missing}")
     
-    processed_df = data.copy()
-    
-    # Ensure datetime index
-    if not pd.api.types.is_datetime64_any_dtype(processed_df.index):
-        processed_df.index = pd.to_datetime(processed_df.index)
-    processed_df = processed_df.sort_index()
+    if data.empty:
+        logger.warning("Empty DataFrame passed to preprocess_data")
+        return data
 
-    # Validate and correct invalid close prices
-    if (processed_df['close'] <= 0).any() or (processed_df['close'] < 10000).any() or (processed_df['close'] > 200200).any():
-        logger.warning("Close prices contain invalid values. Correcting to default BTC price range.")
-        processed_df['close'] = processed_df['close'].apply(lambda x: 78877.88 if x <= 0 or pd.isna(x) or x < 10000 or x > 200200 else x)
+    # Ensure the index is a DatetimeIndex
+    if not isinstance(data.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame index must be a DatetimeIndex")
 
-    # Calculate basic features
-    processed_df['returns'] = processed_df['close'].pct_change()
-    processed_df['log_returns'] = np.log1p(processed_df['returns'])
-    processed_df['price_volatility'] = processed_df['log_returns'].rolling(window=24).std().fillna(0)
-    
-    # Simple Moving Average (SMA)
-    processed_df['sma_20'] = processed_df['close'].rolling(window=20).mean()
-    
-    # Average True Range (ATR)
-    processed_df['atr'] = ta.volatility.AverageTrueRange(
-        high=processed_df['high'],
-        low=processed_df['low'],
-        close=processed_df['close'],
-        window=14
-    ).average_true_range().fillna(500.0)  # Default ATR value
-    
-    # Volume Weighted Average Price (VWAP)
-    typical_price = (processed_df['high'] + processed_df['low'] + processed_df['close']) / 3
-    processed_df['vwap'] = (typical_price * processed_df['volume']).cumsum() / processed_df['volume'].cumsum()
-    processed_df['vwap'] = processed_df['vwap'].ffill().fillna(0)  # Updated to use ffill instead of deprecated method
-    
-    # Average Directional Index (ADX)
-    processed_df['adx'] = ta.trend.ADXIndicator(
-        high=processed_df['high'],
-        low=processed_df['low'],
-        close=processed_df['close'],
-        window=14
-    ).adx().fillna(10.0)  # Default ADX value
-    
-    # Momentum (RSI)
-    processed_df['momentum_rsi'] = ta.momentum.RSIIndicator(close=processed_df['close'], window=14).rsi().fillna(50.0)
-    
-    # Trend (MACD)
-    macd = ta.trend.MACD(close=processed_df['close'], window_slow=26, window_fast=12)
-    processed_df['trend_macd'] = macd.macd().fillna(0)
-    processed_df['macd_signal'] = macd.macd_signal().fillna(0)
-    
-    # Exponential Moving Average (EMA)
-    processed_df['ema_50'] = processed_df['close'].ewm(span=50, adjust=False).mean()
-    
-    # Bollinger Bands
-    bb = ta.volatility.BollingerBands(close=processed_df['close'], window=20, window_dev=2)
-    processed_df['bollinger_upper'] = bb.bollinger_hband()
-    processed_df['bollinger_lower'] = bb.bollinger_lband()
-    processed_df['bollinger_middle'] = bb.bollinger_mavg()
-    # Map to FEATURE_COLUMNS names if different
-    processed_df['bb_upper'] = processed_df['bollinger_upper']
-    processed_df['bb_middle'] = processed_df['bollinger_middle']
-    processed_df['bb_lower'] = processed_df['bollinger_lower']
-    # Calculate Bollinger Bands breakout (1 for upper breakout, -1 for lower breakout, 0 otherwise)
-    processed_df['bb_breakout'] = 0
-    processed_df.loc[processed_df['close'] > processed_df['bb_upper'], 'bb_breakout'] = 1
-    processed_df.loc[processed_df['close'] < processed_df['bb_lower'], 'bb_breakout'] = -1
-    
-    # VPVR features
-    vpvr_lookback = 500
-    window_data = processed_df.tail(vpvr_lookback)
-    vpvr_features = calculate_vpvr(window_data)
-    for key, value in vpvr_features.items():
-        processed_df[key] = value.reindex(processed_df.index, method='ffill').fillna(0)
-    
-    # LuxAlgo signals
-    processed_df['luxalgo_signal'] = generate_luxalgo_signals(processed_df)
-    logger.info(f"Generated LuxAlgo signals: {processed_df['luxalgo_signal'].value_counts().to_dict()}")
-    
-    # TrendSpider signals
-    processed_df['trendspider_signal'] = generate_trendspider_signals(processed_df)
-    logger.info(f"Generated TrendSpider signals: {processed_df['trendspider_signal'].value_counts().to_dict()}")
-    
-    # MetaStock trend slope
-    processed_df['metastock_slope'] = generate_metastock_slope(processed_df)
-    
-    # Additional features
-    halving_dates = [
-        pd.Timestamp("2012-11-28"),
-        pd.Timestamp("2016-07-09"),
-        pd.Timestamp("2020-05-11"),
-        pd.Timestamp("2024-04-19"),
-        pd.Timestamp("2028-03-15")
-    ]
-    processed_df['days_to_next_halving'] = [calculate_days_to_next_halving(idx, halving_dates)[0] for idx in processed_df.index]
-    processed_df['days_since_last_halving'] = [(idx - max([h for h in halving_dates if h <= idx])).days if any(h <= idx for h in halving_dates) else 0 for idx in processed_df.index]
-    processed_df['garch_volatility'] = processed_df['log_returns'].rolling(window=24).std().fillna(0)  # Simple proxy for GARCH
-    processed_df['volume_normalized'] = processed_df['volume'] / processed_df['volume'].rolling(window=20).mean().fillna(1.0)
-    processed_df['hour_of_day'] = processed_df.index.hour
-    processed_df['day_of_week'] = processed_df.index.dayofweek
-    processed_df['smrt_scalping_signal'] = smrt_scalping_signals(processed_df, atr_multiplier=1.0)
+    df = data.copy()
 
-    # Handle missing values
-    processed_df = processed_df.fillna(0)
-    
-    # Ensure all required columns are present
+    # Remove duplicates in the index and sort
+    df = df[~df.index.duplicated(keep='first')]
+    df.sort_index(inplace=True)
+
+    # Validate and correct close prices
+    earliest_valid_close = df['close'].dropna().iloc[0] if not df['close'].dropna().empty else 14.54
+    valid_range_min = max(0.01, earliest_valid_close * 0.1)
+    valid_range_max = 200200
+    if (df['close'] <= 0).any() or (df['close'] < valid_range_min).any() or (df['close'] > valid_range_max).any():
+        logger.warning(f"Close prices contain invalid values. Correcting to nearest valid value or {earliest_valid_close:.2f}.")
+        df['close'] = df['close'].apply(
+            lambda x: df['close'].iloc[max(df.index.get_loc(df.index[df['close'].notna()].get_loc(x, method='nearest')), 0)]
+            if pd.isna(x) or x <= 0 or x < valid_range_min or x > valid_range_max else x
+        )
+
+    # Basic features
+    df['returns'] = df['close'].pct_change()
+    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+    df['price_volatility'] = df['log_returns'].rolling(window=24, min_periods=1).std().fillna(0.0)
+    df['sma_20'] = df['close'].rolling(window=20).mean()
+    df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['volume_normalized'] = (df['volume'] - df['volume'].rolling(window=24, min_periods=1).mean()) / df['volume'].rolling(window=24, min_periods=1).std()
+
+    # Time-based features using the index
+    df['hour_of_day'] = df.index.hour
+    df['day_of_week'] = df.index.dayofweek
+    df['month'] = df.index.month
+    df['day_of_month'] = df.index.day
+    df['quarter'] = df.index.quarter
+    df['days_to_next_halving'] = df.index.map(lambda x: calculate_days_to_next_halving(x)[0])
+    df['days_since_last_halving'] = df.index.map(calculate_days_since_last_halving)
+
+    # Advanced features
+    df['target'] = df['log_returns'].shift(-1).fillna(0.0)
+    df['garch_volatility'] = compute_garch_volatility(df['log_returns'])
+    df['luxalgo_signal'] = compute_supertrend(df, length=7, multiplier=2.0)
+    df['trendspider_signal'] = compute_ichimoku_signals(df, tenkan=9, kijun=26, senkou=52)
+    ema_slope = compute_ema_slope(df, ema_period=20, slope_window=5)
+    df = df.join(ema_slope)
+
+    # Compute additional indicators from indicators.py
+    df['atr'] = calculate_atr(df, period=14)
+    df['atr_normalized'] = df['atr'] / df['close']
+    df['vwap'] = compute_vwap(df)
+    df['adx'] = compute_adx(df, period=14)
+    df['momentum_rsi'] = calculate_rsi(df['close'])
+    macd, macd_signal = calculate_macd(df['close'])
+    df['trend_macd'] = macd
+    df['macd_signal'] = macd_signal
+    df['macd_histogram'] = macd - macd_signal
+    bb_upper, bb_middle, bb_lower, bb_breakout, bb_bandwidth = compute_bollinger_bands(df['close'])
+    df['bb_upper'] = bb_upper
+    df['bb_middle'] = bb_middle
+    df['bb_lower'] = bb_lower
+    df['bb_breakout'] = bb_breakout
+    df['bb_bandwidth'] = bb_bandwidth
+    vpvr_metrics = calculate_vpvr(df)
+    df['dist_to_poc'] = vpvr_metrics['dist_to_poc']
+    df['dist_to_hvn_upper'] = vpvr_metrics['dist_to_hvn_upper']
+    df['dist_to_hvn_lower'] = vpvr_metrics['dist_to_hvn_lower']
+    df['dist_to_lvn_upper'] = vpvr_metrics['dist_to_lvn_upper']
+    df['dist_to_lvn_lower'] = vpvr_metrics['dist_to_lvn_lower']
+    stoch_k, stoch_d, stoch_signal = calculate_stochastic_oscillator(df)
+    df['stoch_k'] = stoch_k
+    df['stoch_d'] = stoch_d
+    df['stoch_signal'] = stoch_signal
+    fib_metrics = calculate_fibonacci_levels(df)
+    df['dist_to_fib_236'] = fib_metrics['dist_to_fib_236']
+    df['dist_to_fib_382'] = fib_metrics['dist_to_fib_382']
+    df['dist_to_fib_618'] = fib_metrics['dist_to_fib_618']
+
+    # SMRT Scalping signals
+    if USE_SMRT_SCALPING:
+        try:
+            df['smrt_scalping_signal'] = smrt_scalping_signals(df, atr_multiplier=1.0)
+        except Exception as e:
+            logger.error(f"Failed to compute SMRT scalping signals: {e}")
+            df['smrt_scalping_signal'] = 0
+    else:
+        logger.info("SMRT scalping signals disabled (USE_SMRT_SCALPING=False), setting smrt_scalping_signal to 0")
+        df['smrt_scalping_signal'] = 0
+
+    # Market regime (simplified)
+    df['market_regime'] = pd.cut(df['price_volatility'], bins=[0, 0.01, 0.03, np.inf], labels=['Low', 'Medium', 'High'], include_lowest=True)
+    # Add 'Neutral' to the categories before filling NaNs
+    df['market_regime'] = df['market_regime'].astype('category')
+    df['market_regime'] = df['market_regime'].cat.add_categories(['Neutral'])
+    df['market_regime'] = df['market_regime'].fillna('Neutral')
+
+    # Ensure all FEATURE_COLUMNS are present
     for col in FEATURE_COLUMNS:
-        if col not in processed_df.columns:
-            logger.warning(f"Feature column {col} not computed, adding with zeros")  # [TODO] Investigate why this feature is missing
-            processed_df[col] = 0
-    
-    logger.info(f"Preprocessed data shape: {processed_df.shape}")
-    logger.info(f"Preprocessed columns: {list(processed_df.columns)}")
-    return processed_df
+        if col not in df.columns and col != 'market_regime':
+            logger.warning(f"Column {col} missing from preprocessed data, filling with 0")
+            df[col] = 0.0
+
+    # Fill NaNs for numeric columns
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].fillna(0)
+
+    logger.info(f"Preprocessed data shape: {df.shape}")
+    logger.info(f"Preprocessed columns: {list(df.columns)}")
+    return df
 
 def scale_features(data: pd.DataFrame, feature_columns: List[str]) -> pd.DataFrame:
     """
     Scale features to [0, 1] range.
-    
+
     Args:
         data (pd.DataFrame): Preprocessed data
         feature_columns (List[str]): Columns to scale
-    
+
     Returns:
         pd.DataFrame: Scaled DataFrame
     """
     scaled_df = data.copy()
     for col in feature_columns:
-        if col in scaled_df.columns:
+        if col in scaled_df.columns and col != 'market_regime':
             min_val = scaled_df[col].min()
             max_val = scaled_df[col].max()
             if max_val != min_val:
@@ -244,5 +258,5 @@ def scale_features(data: pd.DataFrame, feature_columns: List[str]) -> pd.DataFra
                 scaled_df[col] = 0
             logger.info(f"Feature {col}: min={min_val:.4f}, max={max_val:.4f}, mean={scaled_df[col].mean():.4f}")
         else:
-            logger.warning(f"Feature {col} not found in DataFrame, skipping scaling")  # [MODULAR NOTE] Check FEATURE_COLUMNS definition
+            logger.warning(f"Feature {col} not found in DataFrame or is categorical, skipping scaling")
     return scaled_df
